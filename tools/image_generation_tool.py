@@ -375,7 +375,7 @@ def image_generate_tool(
             "output_format": validated_params["output_format"],
             "enable_safety_checker": ENABLE_SAFETY_CHECKER,
             "safety_tolerance": SAFETY_TOLERANCE,
-            "sync_mode": True  # Use sync mode for immediate results
+            #"sync_mode": True  # Use sync mode for immediate results
         }
         
         # Add seed if provided
