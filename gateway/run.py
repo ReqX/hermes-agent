@@ -1597,6 +1597,14 @@ class GatewayRunner:
                         )
             return None
         
+        # --- Permission tier: time restriction check (opt-in) ---
+        _msg_tier_name = self._resolve_user_tier(source)
+        _msg_tier_cfg = self._get_tier_config(_msg_tier_name)
+        if _msg_tier_cfg is not None and _msg_tier_cfg.time_restrictions is not None:
+            _time_ok, _time_reason = self._is_within_time_window(_msg_tier_cfg)
+            if not _time_ok:
+                return self._format_tier_message(_msg_tier_cfg, _time_reason, source)
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -1734,6 +1742,13 @@ class GatewayRunner:
         # Resolve aliases to canonical name so dispatch only checks canonicals.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        # Admin-only slash commands — gated by permission tier
+        _tiered_admin_commands = {"model", "provider", "update", "reload-mcp", "config"}
+        if canonical in _tiered_admin_commands:
+            _cmd_tier = self._get_tier_config(self._resolve_user_tier(source))
+            if _cmd_tier is not None and not _cmd_tier.allow_admin_commands:
+                return self._format_tier_message(_cmd_tier, "command_denied", source)
 
         if canonical == "new":
             return await self._handle_reset_command(event)
@@ -2599,17 +2614,19 @@ class GatewayRunner:
                 if pending:
                     pending["timestamp"] = _time.time()
                     self._pending_approvals[session_key] = pending
-                    # Append structured instructions so the user knows how to respond
-                    cmd_preview = pending.get("command", "")
-                    if len(cmd_preview) > 200:
-                        cmd_preview = cmd_preview[:200] + "..."
-                    approval_hint = (
-                        f"\n\n⚠️ **Dangerous command requires approval:**\n"
-                        f"```\n{cmd_preview}\n```\n"
-                        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                        f"for the session, or `/deny` to cancel."
-                    )
-                    response = (response or "") + approval_hint
+                    # Append approval hint only if user has exec permission
+                    _hint_tier = self._get_tier_config(self._resolve_user_tier(source))
+                    if _hint_tier is None or _hint_tier.allow_exec:
+                        cmd_preview = pending.get("command", "")
+                        if len(cmd_preview) > 200:
+                            cmd_preview = cmd_preview[:200] + "..."
+                        approval_hint = (
+                            f"\n\n⚠️ **Dangerous command requires approval:**\n"
+                            f"```\n{cmd_preview}\n```\n"
+                            f"Reply `/approve` to execute, `/approve session` to approve this pattern "
+                            f"for the session, or `/deny` to cancel."
+                        )
+                        response = (response or "") + approval_hint
             except Exception as e:
                 logger.debug("Failed to check pending approvals: %s", e)
             
@@ -4347,11 +4364,19 @@ class GatewayRunner:
     async def _handle_approve_command(self, event: MessageEvent) -> str:
         """Handle /approve command — execute a pending dangerous command.
 
+        Gated by permission tier: users without allow_exec get a denial.
+
         Usage:
             /approve          — approve and execute the pending command
             /approve session  — approve and remember for this session
             /approve always   — approve this pattern permanently
         """
+        # Permission check
+        _tier_name = self._resolve_user_tier(event.source)
+        _tier_cfg = self._get_tier_config(_tier_name)
+        if _tier_cfg is not None and not _tier_cfg.allow_exec:
+            return self._format_tier_message(_tier_cfg, "exec_denied", event.source)
+
         source = event.source
         session_key = self._session_key_for_source(source)
 
@@ -4399,7 +4424,15 @@ class GatewayRunner:
         return f"✅ Command approved and executed{scope_msg}.\n\n```\n{result[:3500]}\n```"
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
-        """Handle /deny command — reject a pending dangerous command."""
+        """Handle /deny command — reject a pending dangerous command.
+
+        Gated by permission tier: users without allow_exec get a denial.
+        """
+        _tier_name = self._resolve_user_tier(event.source)
+        _tier_cfg = self._get_tier_config(_tier_name)
+        if _tier_cfg is not None and not _tier_cfg.allow_exec:
+            return self._format_tier_message(_tier_cfg, "exec_denied", event.source)
+
         source = event.source
         session_key = self._session_key_for_source(source)
 
@@ -4929,6 +4962,37 @@ class GatewayRunner:
                 return False, "time_restricted_after"
 
         return True, None
+
+    def _format_tier_message(self, tier, key, source):
+        """Look up i18n message template by key. Fallback: key+locale -> key+en -> hardcoded."""
+        pt = getattr(getattr(self, 'config', None), 'permission_tiers', None)
+        locale = "en"
+        if pt:
+            user_cfg = pt.users.get(source.user_id) or pt.users.get("*")
+            if user_cfg:
+                locale = user_cfg.locale
+
+        template = (tier.messages or {}).get(key, {}).get(locale)
+        if not template:
+            template = (tier.messages or {}).get(key, {}).get("en")
+
+        tr = tier.time_restrictions
+        if template and tr:
+            try:
+                return template.format(start=tr.start, end=tr.end, timezone=tr.timezone)
+            except KeyError:
+                return template
+        if template:
+            return template
+
+        fallbacks = {
+            "exec_denied": "You don't have permission to approve or deny commands.",
+            "command_denied": "That command is only available to admins.",
+            "time_restricted_before": f"Access starts at {tr.start if tr else '08:00'}.",
+            "time_restricted_after": f"Access ended at {tr.end if tr else '22:00'}.",
+            "time_restricted_wrong_day": "Not available today.",
+        }
+        return fallbacks.get(key, "Permission denied.")
 
     @staticmethod
     def _agent_config_signature(
