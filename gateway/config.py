@@ -333,8 +333,26 @@ class PermissionTiersConfig:
         users = {}
         for user_id, user_data in data.get("users", {}).items():
             users[user_id] = UserTierConfig.from_dict(user_data)
+        default_tier = data.get("default_tier", "admin")
+        # Belt-and-suspenders: ensure default_tier exists in tiers.
+        # If not, inject a permissive admin definition so the fallback
+        # chain never returns a tier name that _get_tier_config() can't find.
+        if default_tier not in tiers:
+            tiers[default_tier] = TierDefinition(
+                allowed_toolsets=["*"],
+                allow_exec=True,
+                allow_admin_commands=True,
+            )
+        # Also ensure every user-referenced tier exists.
+        for uid, ucfg in users.items():
+            if ucfg.tier not in tiers:
+                tiers[ucfg.tier] = TierDefinition(
+                    allowed_toolsets=["*"],
+                    allow_exec=True,
+                    allow_admin_commands=True,
+                )
         return cls(
-            default_tier=data.get("default_tier", "admin"),
+            default_tier=default_tier,
             tiers=tiers,
             users=users,
         )

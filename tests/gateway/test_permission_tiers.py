@@ -206,6 +206,29 @@ class TestPermissionTiersConfig:
         assert restored.permission_tiers is not None
         assert restored.permission_tiers.default_tier == "admin"
 
+    def test_from_dict_injects_missing_default_tier(self):
+        """If default_tier references a nonexistent tier, from_dict auto-injects it."""
+        data = {
+            "default_tier": "standard",
+            "tiers": {"admin": {"allowed_toolsets": ["*"]}},
+            "users": {},
+        }
+        pt = PermissionTiersConfig.from_dict(data)
+        assert "standard" in pt.tiers
+        assert pt.tiers["standard"].allowed_toolsets == ["*"]
+        assert pt.tiers["standard"].allow_exec is True
+
+    def test_from_dict_injects_missing_user_tier(self):
+        """If a user references a nonexistent tier, from_dict auto-injects it."""
+        data = {
+            "default_tier": "admin",
+            "tiers": {"admin": {"allowed_toolsets": ["*"]}},
+            "users": {"u1": {"tier": "ghost", "locale": "en"}},
+        }
+        pt = PermissionTiersConfig.from_dict(data)
+        assert "ghost" in pt.tiers
+        assert pt.tiers["ghost"].allow_exec is True
+
 
 # ------------------------------------------------------------------
 # Phase 2: Tier Resolution & Tool Gating
