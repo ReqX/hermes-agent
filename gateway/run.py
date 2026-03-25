@@ -212,6 +212,9 @@ from gateway.config import (
     Platform,
     GatewayConfig,
     load_gateway_config,
+    TimeRestrictions,
+    TierDefinition,
+    PermissionTiersConfig,
 )
 from gateway.session import (
     SessionStore,
@@ -4865,12 +4868,75 @@ class GatewayRunner:
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
 
+    def _resolve_user_tier(self, source):
+        """Return tier name for user. Fallback: user config -> default_tier -> 'admin'."""
+        pt = getattr(getattr(self, 'config', None), 'permission_tiers', None)
+        if pt is None:
+            return "admin"
+        user_cfg = pt.users.get(source.user_id) or pt.users.get("*")
+        if user_cfg:
+            return user_cfg.tier
+        return pt.default_tier
+
+    def _get_tier_config(self, tier_name):
+        """Return TierDefinition or None if permission tiers unconfigured."""
+        pt = getattr(getattr(self, 'config', None), 'permission_tiers', None)
+        if pt is None:
+            return None
+        return pt.tiers.get(tier_name)
+
+    def _get_tier_allowed_toolsets(self, tier_name):
+        """Return allowed toolset list. ['*'] = all allowed."""
+        tier = self._get_tier_config(tier_name)
+        if tier is None:
+            return ["*"]
+        return tier.allowed_toolsets
+
+    def _is_within_time_window(self, tier):
+        """Check time restrictions. Returns (allowed, reason_key_or_None).
+
+        Handles cross-midnight windows (e.g. 22:00 -> 07:00).
+        """
+        if tier is None or tier.time_restrictions is None:
+            return True, None
+        tr = tier.time_restrictions
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+
+        try:
+            tz = ZoneInfo(tr.timezone)
+        except Exception:
+            tz = ZoneInfo("UTC")
+
+        now = datetime.now(tz)
+        if tr.days is not None and now.weekday() not in tr.days:
+            return False, "time_restricted_wrong_day"
+
+        start_h, start_m = map(int, tr.start.split(":"))
+        end_h, end_m = map(int, tr.end.split(":"))
+        now_minutes = now.hour * 60 + now.minute
+        start_minutes = start_h * 60 + start_m
+        end_minutes = end_h * 60 + end_m
+
+        if start_minutes <= end_minutes:
+            if now_minutes < start_minutes:
+                return False, "time_restricted_before"
+            if now_minutes >= end_minutes:
+                return False, "time_restricted_after"
+        else:
+            # Cross-midnight (e.g. 22:00 -> 07:00)
+            if now_minutes < start_minutes and now_minutes >= end_minutes:
+                return False, "time_restricted_after"
+
+        return True, None
+
     @staticmethod
     def _agent_config_signature(
         model: str,
         runtime: dict,
         enabled_toolsets: list,
         ephemeral_prompt: str,
+        user_tier: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -4899,6 +4965,7 @@ class GatewayRunner:
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
+                user_tier or "",
             ],
             sort_keys=True,
             default=str,
@@ -4944,6 +5011,13 @@ class GatewayRunner:
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+        # --- Permission tier filtering (opt-in) ---
+        _tier_name = self._resolve_user_tier(source)
+        _tier_cfg = self._get_tier_config(_tier_name)
+        if _tier_cfg is not None:
+            _allowed = self._get_tier_allowed_toolsets(_tier_name)
+            if "*" not in _allowed:
+                enabled_toolsets = [ts for ts in enabled_toolsets if ts in _allowed]
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility.
         # YAML 1.1 parses bare `off` as boolean False — normalise before
@@ -5171,6 +5245,19 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            # Inject tier system prompt (soft enforcement)
+            if _tier_cfg is not None and "*" not in _allowed:
+                _tier_prompt = (
+                    f"You are operating with restricted permissions (tier: {_tier_name}). "
+                    f"Only these toolsets are available: {', '.join(_allowed)}. "
+                    "Do not attempt to use tools outside your permitted set."
+                )
+                combined_ephemeral = (
+                    (_tier_prompt + "\n\n" + combined_ephemeral).strip()
+                    if combined_ephemeral
+                    else _tier_prompt
+                )
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
             try:
@@ -5235,6 +5322,7 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
+                _tier_name,
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
