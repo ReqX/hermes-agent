@@ -4902,14 +4902,26 @@ class GatewayRunner:
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
 
     def _resolve_user_tier(self, source):
-        """Return tier name for user. Fallback: user config -> default_tier -> 'admin'."""
+        """Return tier name for user. Fallback: user config -> default_tier -> 'admin'.
+
+        Validates that the resolved tier exists in the config. If not, falls
+        back to default_tier (or 'admin') to avoid fail-open on typos.
+        """
         pt = getattr(getattr(self, 'config', None), 'permission_tiers', None)
         if pt is None:
             return "admin"
         user_cfg = pt.users.get(source.user_id) or pt.users.get("*")
-        if user_cfg:
-            return user_cfg.tier
-        return pt.default_tier
+        tier_name = user_cfg.tier if user_cfg else pt.default_tier
+        # Validate tier exists — fail-closed on unknown tier names (typos)
+        if tier_name not in pt.tiers:
+            logger.warning(
+                "Permission tier '%s' not defined, falling back to '%s'",
+                tier_name, pt.default_tier,
+            )
+            tier_name = pt.default_tier
+            if tier_name not in pt.tiers:
+                tier_name = "admin"
+        return tier_name
 
     def _get_tier_config(self, tier_name):
         """Return TierDefinition or None if permission tiers unconfigured."""
@@ -4945,11 +4957,21 @@ class GatewayRunner:
         if tr.days is not None and now.weekday() not in tr.days:
             return False, "time_restricted_wrong_day"
 
-        start_h, start_m = map(int, tr.start.split(":"))
-        end_h, end_m = map(int, tr.end.split(":"))
+        try:
+            start_h, start_m = map(int, tr.start.split(":"))
+            end_h, end_m = map(int, tr.end.split(":"))
+        except (ValueError, TypeError):
+            logger.warning("Invalid time restriction format: %s-%s, allowing access", tr.start, tr.end)
+            return True, None
+
         now_minutes = now.hour * 60 + now.minute
         start_minutes = start_h * 60 + start_m
         end_minutes = end_h * 60 + end_m
+
+        # Validate parsed values
+        if not (0 <= start_minutes < 1440 and 0 <= end_minutes < 1440):
+            logger.warning("Invalid time restriction: %s-%s, allowing access", tr.start, tr.end)
+            return True, None
 
         if start_minutes <= end_minutes:
             if now_minutes < start_minutes:

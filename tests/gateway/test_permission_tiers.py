@@ -101,9 +101,10 @@ def _restricted_tier(
 
 
 def _make_permission_config(tiers=None, users=None, default_tier="admin"):
+    _default_tiers = {"admin": _admin_tier(), "restricted": _restricted_tier()}
     return PermissionTiersConfig(
         default_tier=default_tier,
-        tiers=tiers or {"admin": _admin_tier()},
+        tiers=tiers if tiers is not None else _default_tiers,
         users=users or {},
     )
 
@@ -217,6 +218,21 @@ class TestTierResolution:
         source = _make_source()
         assert runner._resolve_user_tier(source) == "admin"
 
+    def test_none_user_id_graceful(self):
+        """user_id=None should not crash — falls to wildcard/default."""
+        pt = _make_permission_config(
+            users={"*": UserTierConfig(tier="restricted")},
+            default_tier="admin",
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            user_id=None,
+            chat_id="c1",
+            chat_type="dm",
+        )
+        assert runner._resolve_user_tier(source) == "restricted"
+
     def test_known_user_returns_their_tier(self):
         pt = _make_permission_config(
             users={"u1": UserTierConfig(tier="restricted")}
@@ -228,6 +244,10 @@ class TestTierResolution:
     def test_unknown_user_falls_to_default_tier(self):
         pt = _make_permission_config(
             default_tier="standard",
+            tiers={
+                "admin": _admin_tier(),
+                "standard": _restricted_tier(),
+            },
             users={"u1": UserTierConfig(tier="admin")},
         )
         runner = _make_runner(permission_tiers=pt)
@@ -249,6 +269,29 @@ class TestTierResolution:
                 "u1": UserTierConfig(tier="admin"),
                 "*": UserTierConfig(tier="restricted"),
             }
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = _make_source(user_id="u1")
+        assert runner._resolve_user_tier(source) == "admin"
+
+    def test_typo_tier_name_fails_closed(self):
+        """User mapped to a nonexistent tier should fall back to default_tier, not fail-open."""
+        pt = _make_permission_config(
+            default_tier="restricted",
+            users={"u1": UserTierConfig(tier="standrad")},  # typo
+            tiers={"admin": _admin_tier(), "restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = _make_source(user_id="u1")
+        # Should NOT return "standrad" (which would bypass all restrictions)
+        assert runner._resolve_user_tier(source) == "restricted"
+
+    def test_typo_tier_falls_to_admin_if_default_also_missing(self):
+        """If both the mapped tier and default_tier are nonexistent, fall to 'admin'."""
+        pt = _make_permission_config(
+            default_tier="nonexistent",
+            users={"u1": UserTierConfig(tier="alsobad")},
+            tiers={"admin": _admin_tier()},
         )
         runner = _make_runner(permission_tiers=pt)
         source = _make_source(user_id="u1")
@@ -411,6 +454,18 @@ class TestTimeRestrictions:
         # Should not raise
         allowed, reason = runner._is_within_time_window(tier)
         assert isinstance(allowed, bool)
+
+    def test_invalid_time_format_allows_access(self):
+        """Garbage time values should fail-open (allow) rather than crash."""
+        tier = _restricted_tier(
+            time_restrictions=TimeRestrictions(
+                start="99:00", end="abc", timezone="UTC"
+            )
+        )
+        runner = _make_runner()
+        allowed, reason = runner._is_within_time_window(tier)
+        # Must not crash; fail-open means allowed=True
+        assert allowed is True
 
 
 # ------------------------------------------------------------------
