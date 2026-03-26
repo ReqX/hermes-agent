@@ -401,6 +401,8 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -411,6 +413,13 @@ def delegate_task(
       - Batch:  provide tasks array [{goal, context, toolsets}, ...]
 
     Returns JSON with results array, one entry per task.
+
+    Per-call model/provider override:
+      - model/provider at the top level apply to all tasks (single or batch).
+      - In batch mode, each task item can specify its own model/provider,
+        which override the top-level values for that task.
+      - Per-call values take precedence over config.yaml delegation settings.
+      - Config values are used as fallback when nothing is specified at call time.
     """
     if parent_agent is None:
         return json.dumps({"error": "delegate_task requires a parent agent context."})
@@ -425,20 +434,10 @@ def delegate_task(
             )
         })
 
-    # Load config
+    # Load config (used as fallback when per-call values are not set)
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
-
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return json.dumps({"error": str(exc)})
 
     # Normalize to task list
     if tasks and isinstance(tasks, list):
@@ -475,6 +474,20 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            # Per-call overrides: task-level > top-level > config
+            task_model = t.get("model") or model or None
+            task_provider = t.get("provider") or provider or None
+
+            # Resolve credentials with per-call overrides merged into config
+            try:
+                creds = _resolve_delegation_credentials(
+                    cfg, parent_agent,
+                    override_model=task_model,
+                    override_provider=task_provider,
+                )
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets, model=creds["model"],
@@ -562,8 +575,18 @@ def delegate_task(
     }, ensure_ascii=False)
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    override_model: Optional[str] = None,
+    override_provider: Optional[str] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
+
+    Resolution priority (highest to lowest):
+      1. Per-call override_model / override_provider (from delegate_task args)
+      2. Config delegation.model / delegation.provider (from config.yaml)
+      3. Parent agent's own model / provider (inheritance)
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. Otherwise, if ``delegation.provider`` is
@@ -577,8 +600,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
+    configured_model = (
+        (override_model or "").strip() or
+        str(cfg.get("model") or "").strip() or None
+    )
+    configured_provider = (
+        (override_provider or "").strip() or
+        str(cfg.get("provider") or "").strip() or None
+    )
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
 
@@ -703,7 +732,11 @@ DELEGATE_TASK_SCHEMA = {
         "- Subagents CANNOT call: delegate_task, clarify, memory, send_message, "
         "execute_code.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
-        "- Results are always returned as an array, one entry per task."
+        "- Results are always returned as an array, one entry per task.\n\n"
+        "MODEL OVERRIDES:\n"
+        "- 'model' and 'provider' let you run subagents on a different model/provider.\n"
+        "- Per-call values override config.yaml delegation settings.\n"
+        "- In batch mode, each task item can specify its own model/provider."
     ),
     "parameters": {
         "type": "object",
@@ -747,6 +780,14 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Toolsets for this specific task",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Override model for this specific task (overrides top-level model)",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Override provider for this specific task (overrides top-level provider)",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -762,6 +803,22 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Max tool-calling turns per subagent (default: 50). "
                     "Only set lower for simple tasks."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Override the model for this subagent (e.g. 'google/gemini-3-flash-preview'). "
+                    "Takes precedence over config.yaml delegation.model. "
+                    "In batch mode, set per-task model inside the tasks array instead."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Override the provider for this subagent (e.g. 'openrouter', 'nous', 'zai'). "
+                    "Takes precedence over config.yaml delegation.provider. "
+                    "In batch mode, set per-task provider inside the tasks array instead."
                 ),
             },
         },
@@ -783,6 +840,8 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        model=args.get("model"),
+        provider=args.get("provider"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",

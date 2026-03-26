@@ -877,5 +877,254 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], parent.base_url)
 
 
+class TestPerCallModelProviderOverride(unittest.TestCase):
+    """Tests for per-call model/provider override in delegate_task."""
+
+    def test_schema_includes_model_and_provider(self):
+        """Schema should expose model and provider as top-level properties."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("model", props)
+        self.assertIn("provider", props)
+        self.assertEqual(props["model"]["type"], "string")
+        self.assertEqual(props["provider"]["type"], "string")
+
+    def test_batch_task_schema_includes_model_and_provider(self):
+        """Batch task items should also support model and provider overrides."""
+        task_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+        self.assertIn("model", task_props)
+        self.assertIn("provider", task_props)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_model_override_reaches_credentials(self, mock_creds, mock_cfg):
+        """Top-level model param should be passed to credential resolution."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        mock_creds.return_value = {
+            "model": "google/gemini-3-flash-preview",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test", model="google/gemini-3-flash-preview", parent_agent=parent)
+
+            # Credentials should have been called with the per-call override
+            mock_creds.assert_called_once()
+            call_kwargs = mock_creds.call_args.kwargs
+            self.assertEqual(call_kwargs["override_model"], "google/gemini-3-flash-preview")
+            self.assertIsNone(call_kwargs["override_provider"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_provider_override_reaches_credentials(self, mock_creds, mock_cfg):
+        """Top-level provider param should be passed to credential resolution."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        mock_creds.return_value = {
+            "model": None,
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test", provider="openrouter", parent_agent=parent)
+
+            call_kwargs = mock_creds.call_args.kwargs
+            self.assertEqual(call_kwargs["override_provider"], "openrouter")
+            self.assertIsNone(call_kwargs["override_model"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_per_task_model_override(self, mock_creds, mock_cfg):
+        """In batch mode, each task's model overrides the top-level model."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        mock_creds.return_value = {
+            "model": "meta-llama/llama-4-scout",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
+            }
+
+            tasks = [
+                {"goal": "Task A", "model": "google/gemini-3-flash-preview"},
+                {"goal": "Task B", "model": "meta-llama/llama-4-scout"},
+            ]
+            delegate_task(tasks=tasks, parent_agent=parent)
+
+            # Should have resolved credentials twice with different models
+            self.assertEqual(mock_creds.call_count, 2)
+            call_0_kwargs = mock_creds.call_args_list[0].kwargs
+            call_1_kwargs = mock_creds.call_args_list[1].kwargs
+            self.assertEqual(call_0_kwargs["override_model"], "google/gemini-3-flash-preview")
+            self.assertEqual(call_1_kwargs["override_model"], "meta-llama/llama-4-scout")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_task_level_overrides_top_level(self, mock_creds, mock_cfg):
+        """Task-level model/provider should override top-level model/provider."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        mock_creds.return_value = {
+            "model": "google/gemini-3-flash-preview",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
+            }
+
+            tasks = [
+                {"goal": "Task A"},  # should use top-level
+                {"goal": "Task B", "model": "deepseek/deepseek-r1"},  # should override
+            ]
+            delegate_task(tasks=tasks, model="google/gemini-3-flash-preview", parent_agent=parent)
+
+            self.assertEqual(mock_creds.call_count, 2)
+            # Task A: no task-level model, should get top-level
+            self.assertEqual(mock_creds.call_args_list[0].kwargs["override_model"], "google/gemini-3-flash-preview")
+            # Task B: has task-level model, should override top-level
+            self.assertEqual(mock_creds.call_args_list[1].kwargs["override_model"], "deepseek/deepseek-r1")
+
+    def test_resolve_credentials_per_call_model_overrides_config(self):
+        """Per-call override_model takes precedence over config model."""
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "config-model", "provider": ""}
+        creds = _resolve_delegation_credentials(
+            cfg, parent, override_model="per-call-model"
+        )
+        self.assertEqual(creds["model"], "per-call-model")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_resolve_credentials_per_call_provider_overrides_config(self, mock_resolve):
+        """Per-call override_provider takes precedence over config provider."""
+        mock_resolve.return_value = {
+            "provider": "per-call-provider",
+            "base_url": "https://per-call.example.com/v1",
+            "api_key": "sk-test-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "", "provider": "config-provider"}
+        creds = _resolve_delegation_credentials(
+            cfg, parent, override_provider="per-call-provider"
+        )
+        self.assertEqual(creds["provider"], "per-call-provider")
+        mock_resolve.assert_called_once_with(requested="per-call-provider")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_resolve_credentials_config_fallback_when_no_override(self, mock_resolve):
+        """When no per-call override, config values are used."""
+        mock_resolve.return_value = {
+            "provider": "config-provider",
+            "base_url": "https://config.example.com/v1",
+            "api_key": "sk-test-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "config-model", "provider": "config-provider"}
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["model"], "config-model")
+        self.assertEqual(creds["provider"], "config-provider")
+        mock_resolve.assert_called_once_with(requested="config-provider")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_resolve_credentials_none_override_does_not_override_config(self, mock_resolve):
+        """Passing override_model=None should not clear config model."""
+        mock_resolve.return_value = {
+            "provider": "config-provider",
+            "base_url": "https://config.example.com/v1",
+            "api_key": "sk-test-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "config-model", "provider": "config-provider"}
+        creds = _resolve_delegation_credentials(
+            cfg, parent, override_model=None, override_provider=None
+        )
+        self.assertEqual(creds["model"], "config-model")
+        self.assertEqual(creds["provider"], "config-provider")
+        mock_resolve.assert_called_once_with(requested="config-provider")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_credential_error_with_per_call_override(self, mock_creds, mock_cfg):
+        """Per-call override that fails credential resolution returns JSON error."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        mock_creds.side_effect = ValueError("Cannot resolve provider 'bad-provider'")
+        parent = _make_mock_parent(depth=0)
+
+        result = json.loads(delegate_task(
+            goal="Test", provider="bad-provider", parent_agent=parent
+        ))
+        self.assertIn("error", result)
+        self.assertIn("bad-provider", result["error"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_no_override_falls_back_to_config_credentials(self, mock_creds, mock_cfg):
+        """Without per-call overrides, config delegation settings are used."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "google/gemini-3-flash-preview",
+            "provider": "openrouter",
+        }
+        mock_creds.return_value = {
+            "model": "google/gemini-3-flash-preview",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test", parent_agent=parent)
+
+            # Should pass None overrides, letting config values through
+            call_kwargs = mock_creds.call_args.kwargs
+            self.assertIsNone(call_kwargs["override_model"])
+            self.assertIsNone(call_kwargs["override_provider"])
+
+
 if __name__ == "__main__":
     unittest.main()
