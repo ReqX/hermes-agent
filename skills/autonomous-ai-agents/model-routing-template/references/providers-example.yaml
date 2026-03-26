@@ -1,0 +1,127 @@
+# Provider Catalog — EXAMPLE
+# Copy this to providers.yaml and customize for your setup.
+#
+# This example shows a multi-provider setup with cost tiers.
+# Adjust model names, costs, and roles to match YOUR configuration.
+
+providers:
+  # ── Provider: copilot (GitHub Copilot) ──────────────────
+  # Billing: monthly quota with per-request multipliers
+  copilot:
+    billing: "monthly quota"
+    models:
+      - id: "gpt-4.1"
+        cost: 0x
+        tier: FREE
+        role: "Fixer"
+        notes: "Grunt work, simple codegen"
+      - id: "gpt-4o"
+        cost: 0x
+        tier: FREE
+        role: "Fixer"
+        notes: "General tasks"
+      - id: "gpt-5-mini"
+        cost: 0x
+        tier: FREE
+        role: "Fixer"
+        notes: "Quick tasks"
+      - id: "claude-haiku-4.5"
+        cost: 0.33x
+        tier: CHEAP
+        role: "Safety Net"
+        notes: "Scout — send after 2+ cheaper models"
+      - id: "gpt-5.4"
+        cost: 1x
+        tier: STANDARD
+        role: "Heavy Hitter"
+        notes: "Price/value frontier champion"
+      - id: "claude-sonnet-4.6"
+        cost: 1x
+        tier: STANDARD
+        role: "Designer"
+        notes: "Second opinion + frontend design specialist"
+      - id: "gpt-5.3-codex"
+        cost: 1x
+        tier: STANDARD
+        role: "Coder"
+        notes: "Coding specialist, architecture"
+      - id: "claude-opus-4.8"
+        cost: 3x
+        tier: EXPENSIVE
+        role: "Frontier"
+        notes: "Last resort. Never self-select without trying cheaper options first."
+      - id: "claude-opus-4.8-fast"
+        cost: 30x
+        tier: NUCLEAR
+        role: "Frontier"
+        notes: "NEVER USE. Blocked by policy."
+
+  # ── Provider: zai (Z.AI / GLM) ─────────────────────────
+  # Billing: subscription with generous limits (~0.1x equivalent)
+  zai:
+    billing: "subscription (effectively unlimited)"
+    models:
+      - id: "glm-5-turbo"
+        cost: ~0.1x
+        tier: CHEAP
+        role: "Coordinator"
+        notes: "The agent itself. Built for orchestration."
+      - id: "glm-5"
+        cost: ~0.25x
+        tier: CHEAP
+        role: "Heavy Hitter"
+        notes: "Near-frontier. Strong coder AND deep thinker."
+      - id: "glm-4.7-flash"
+        cost: ~0.1x
+        tier: CHEAP
+        role: "Explorer"
+        notes: "Fast scouting, codebase recon"
+      - id: "glm-4.6"
+        cost: ~0.1x
+        tier: CHEAP
+        role: "Fixer"
+        notes: "Tight-plan execution. 20 parallel, no token limits. NOT open-ended."
+      - id: "glm-4.6v"
+        cost: ~0.1x
+        tier: CHEAP
+        role: "Fixer"
+        notes: "Vision variant — image analysis"
+
+# ── User Override Phrases ────────────────────────────────
+# Map natural language to routing actions.
+overrides:
+  "use opus": { provider: "copilot", model: "claude-opus-4.8" }
+  "use sonnet": { provider: "copilot", model: "claude-sonnet-4.6" }
+  "second opinion": { provider: "copilot", model: "claude-sonnet-4.6" }
+  "coding specialist": { provider: "copilot", model: "gpt-5.3-codex" }
+  "think with me": { action: "escalate", min_tier: "STANDARD" }
+  "burn the budget": { action: "escalate", min_tier: "EXPENSIVE" }
+
+# ── Patterns ─────────────────────────────────────────────
+# Named delegation patterns for common scenarios.
+patterns:
+  free-stack:
+    description: "Maximum throughput at minimal cost"
+    tasks:
+      - { goal: "Deep analysis...", provider: "zai", model: "glm-5" }
+      - { goal: "Explore subsystem...", provider: "zai", model: "glm-4.7-flash" }
+      - { goal: "Apply refactor A...", provider: "zai", model: "glm-4.6" }
+      - { goal: "Apply refactor B...", provider: "zai", model: "glm-4.6" }
+    total_cost: "~0.55x"
+
+  scout-party:
+    description: "2:1 cheap models to safety net, safety net last"
+    rule: "Send 3+ cheapest first, safety net only if needed"
+    tasks:
+      - { goal: "Investigate X...", provider: "zai", model: "glm-4.6" }
+      - { goal: "Investigate Y...", provider: "zai", model: "glm-4.6" }
+      - { goal: "Investigate Z...", provider: "zai", model: "glm-4.6" }
+      - { goal: "Safety net...", provider: "copilot", model: "claude-haiku-4.5" }
+
+  three-for-one:
+    description: "3 diverse 1x opinions for the cost of 1 expensive call"
+    tasks:
+      - { goal: "Review architecture...", provider: "copilot", model: "claude-sonnet-4.6" }
+      - { goal: "Review architecture...", provider: "copilot", model: "gpt-5.4" }
+      - { goal: "Review architecture...", provider: "copilot", model: "gpt-5.3-codex" }
+    total_cost: "3x (= 1 Opus call, but 3 perspectives)"
