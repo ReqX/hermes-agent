@@ -1777,9 +1777,11 @@ class HermesCLI:
                 _skin = get_active_skin()
                 label = _skin.get_branding("response_label", "⚕ Hermes")
                 _text_hex = _skin.get_color("banner_text", "#FFF8DC")
+                _border_hex = _skin.get_color("response_border", "#FFD700")
             except Exception:
                 label = "⚕ Hermes"
                 _text_hex = "#FFF8DC"
+                _border_hex = "#FFD700"
             # Build a true-color ANSI escape for the response text color
             # so streamed content matches the Rich Panel appearance.
             try:
@@ -1789,9 +1791,17 @@ class HermesCLI:
                 self._stream_text_ansi = f"\033[38;2;{_r};{_g};{_b}m"
             except (ValueError, IndexError):
                 self._stream_text_ansi = ""
+            # Build a true-color ANSI escape for the border color
+            try:
+                _br = int(_border_hex[1:3], 16)
+                _bg = int(_border_hex[3:5], 16)
+                _bb = int(_border_hex[5:7], 16)
+                self._stream_border_ansi = f"\033[1;38;2;{_br};{_bg};{_bb}m"
+            except (ValueError, IndexError):
+                self._stream_border_ansi = _GOLD
             w = shutil.get_terminal_size().columns
             fill = w - 2 - len(label)
-            _cprint(f"\n{_GOLD}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+            _cprint(f"\n{self._stream_border_ansi}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
         self._stream_buf += text
 
@@ -1814,7 +1824,8 @@ class HermesCLI:
         # Close the response box
         if self._stream_box_opened:
             w = shutil.get_terminal_size().columns
-            _cprint(f"{_GOLD}╰{'─' * (w - 2)}╯{_RST}")
+            _border = getattr(self, "_stream_border_ansi", _GOLD)
+            _cprint(f"{_border}╰{'─' * (w - 2)}╯{_RST}")
 
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
@@ -5613,9 +5624,19 @@ class HermesCLI:
                     if not _streaming_box_opened:
                         _streaming_box_opened = True
                         w = self.console.width
-                        label = " ⚕ Hermes "
+                        try:
+                            from hermes_cli.skin_engine import get_active_skin
+                            label = get_active_skin().get_branding("response_label", "⚕ Hermes")
+                            _border_hex = get_active_skin().get_color("response_border", "#FFD700")
+                            _br = int(_border_hex[1:3], 16)
+                            _bg = int(_border_hex[3:5], 16)
+                            _bb = int(_border_hex[5:7], 16)
+                            _border_ansi = f"\033[1;38;2;{_br};{_bg};{_bb}m"
+                        except Exception:
+                            label = "⚕ Hermes"
+                            _border_ansi = _GOLD
                         fill = w - 2 - len(label)
-                        _cprint(f"\n{_GOLD}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+                        _cprint(f"\n{_border_ansi}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
                     _cprint(sentence.rstrip())
 
                 tts_thread = threading.Thread(
@@ -5826,7 +5847,16 @@ class HermesCLI:
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = shutil.get_terminal_size().columns
-                    _cprint(f"\n{_GOLD}╰{'─' * (w - 2)}╯{_RST}")
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _bh = get_active_skin().get_color("response_border", "#FFD700")
+                        _r = int(_bh[1:3], 16)
+                        _g = int(_bh[3:5], 16)
+                        _b = int(_bh[5:7], 16)
+                        _ba = f"\033[1;38;2;{_r};{_g};{_b}m"
+                    except Exception:
+                        _ba = _GOLD
+                    _cprint(f"\n{_ba}╰{'─' * (w - 2)}╯{_RST}")
                 elif already_streamed:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
@@ -7123,19 +7153,30 @@ class HermesCLI:
         )
         
         # Style for the application
+        # Skin-aware status bar colors
+        _sb_bg = "#1a1a2e"
+        _sb_strong = "#FFD700"
+        _sb_dim = "#8B8682"
+        try:
+            from hermes_cli.skin_engine import get_active_skin
+            _sk = get_active_skin()
+            _sb_strong = _sk.get_color("banner_accent", "#FFD700")
+            _sb_dim = _sk.get_color("banner_dim", "#8B8682")
+        except Exception:
+            pass
         self._tui_style_base = {
             'input-area': '#FFF8DC',
             'placeholder': '#555555 italic',
             'prompt': '#FFF8DC',
             'prompt-working': '#888888 italic',
             'hint': '#555555 italic',
-            'status-bar': 'bg:#1a1a2e #C0C0C0',
-            'status-bar-strong': 'bg:#1a1a2e #FFD700 bold',
-            'status-bar-dim': 'bg:#1a1a2e #8B8682',
-            'status-bar-good': 'bg:#1a1a2e #8FBC8F bold',
-            'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
-            'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
-            'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
+            'status-bar': f'bg:{_sb_bg} #C0C0C0',
+            'status-bar-strong': f'bg:{_sb_bg} {_sb_strong} bold',
+            'status-bar-dim': f'bg:{_sb_bg} {_sb_dim}',
+            'status-bar-good': f'bg:{_sb_bg} #8FBC8F bold',
+            'status-bar-warn': f'bg:{_sb_bg} #FFD700 bold',
+            'status-bar-bad': f'bg:{_sb_bg} #FF8C00 bold',
+            'status-bar-critical': f'bg:{_sb_bg} #FF6B6B bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges
