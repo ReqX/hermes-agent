@@ -1,3 +1,4 @@
+.audit/
 /venv/
 /_pycache/
 *.pyc*

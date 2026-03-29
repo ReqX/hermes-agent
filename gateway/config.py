@@ -241,11 +241,34 @@ class TimeRestrictions:
     def from_dict(cls, data: Dict[str, Any]) -> "TimeRestrictions":
         if not data:
             return cls()
+        start = data.get("start", "08:00")
+        end = data.get("end", "22:00")
+        if start == end:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "TimeRestrictions: start == end (%s), which means always restricted "
+                "(zero-length window). If you want 24h access, omit time_restrictions.",
+                start,
+            )
+        days = data.get("days")
+        if days is not None:
+            valid_days = [d for d in days if isinstance(d, int) and 0 <= d <= 6]
+            if len(valid_days) != len(days):
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "TimeRestrictions: days contains out-of-range values %s, "
+                    "filtered to %s (valid range: 0=Mon..6=Sun)",
+                    days,
+                    valid_days,
+                )
+            days = valid_days
         return cls(
-            start=data.get("start", "08:00"),
-            end=data.get("end", "22:00"),
+            start=start,
+            end=end,
             timezone=data.get("timezone", "UTC"),
-            days=data.get("days"),
+            days=days,
         )
 
 
@@ -275,11 +298,26 @@ class TierDefinition:
     def from_dict(cls, data: Dict[str, Any]) -> "TierDefinition":
         if not data:
             return cls()
+        # Validate allowed_toolsets type — fail-closed on wrong type
+        raw_toolsets = data.get("allowed_toolsets")
+        if raw_toolsets is None:
+            allowed_toolsets = ["*"]
+        elif isinstance(raw_toolsets, list):
+            allowed_toolsets = [str(t) for t in raw_toolsets]
+        else:
+            logger.warning(
+                "TierDefinition: allowed_toolsets must be a list, got %s; "
+                "defaulting to [] (fail-closed)",
+                type(raw_toolsets).__name__,
+            )
+            allowed_toolsets = []
         tr = data.get("time_restrictions")
         return cls(
-            allowed_toolsets=data.get("allowed_toolsets", ["*"]),
-            allow_exec=data.get("allow_exec", True),
-            allow_admin_commands=data.get("allow_admin_commands", True),
+            allowed_toolsets=allowed_toolsets,
+            allow_exec=_coerce_bool(data.get("allow_exec"), default=True),
+            allow_admin_commands=_coerce_bool(
+                data.get("allow_admin_commands"), default=True
+            ),
             time_restrictions=TimeRestrictions.from_dict(tr) if tr else None,
             messages=data.get("messages", {}),
         )
@@ -289,7 +327,7 @@ class TierDefinition:
 class UserTierConfig:
     """Maps a single user (by platform ID) to a tier and locale."""
 
-    tier: str = "admin"
+    tier: Optional[str] = None
     locale: str = "en"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -303,7 +341,7 @@ class UserTierConfig:
         if not data:
             return cls()
         return cls(
-            tier=data.get("tier", "admin"),
+            tier=data.get("tier"),
             locale=data.get("locale", "en"),
         )
 
@@ -334,28 +372,57 @@ class PermissionTiersConfig:
         for user_id, user_data in data.get("users", {}).items():
             users[user_id] = UserTierConfig.from_dict(user_data)
         default_tier = data.get("default_tier", "admin")
-        # Belt-and-suspenders: ensure default_tier exists in tiers.
-        # If not, inject a permissive admin definition so the fallback
-        # chain never returns a tier name that _get_tier_config() can't find.
+        # Fail-closed: ensure referenced tiers exist. If a tier name is
+        # missing (typo, stale config), inject the MOST restrictive
+        # definition — empty toolsets, no exec, no admin — so the user
+        # is locked out rather than silently elevated.
+        _restrictive = TierDefinition(
+            allowed_toolsets=[],
+            allow_exec=False,
+            allow_admin_commands=False,
+        )
         if default_tier not in tiers:
-            tiers[default_tier] = TierDefinition(
-                allowed_toolsets=["*"],
-                allow_exec=True,
-                allow_admin_commands=True,
+            logger.warning(
+                "Permission tier '%s' (default_tier) not defined — "
+                "injecting restrictive fallback",
+                default_tier,
             )
-        # Also ensure every user-referenced tier exists.
+            tiers[default_tier] = TierDefinition(**_restrictive.to_dict())
         for uid, ucfg in users.items():
             if ucfg.tier not in tiers:
-                tiers[ucfg.tier] = TierDefinition(
-                    allowed_toolsets=["*"],
-                    allow_exec=True,
-                    allow_admin_commands=True,
+                logger.warning(
+                    "Permission tier '%s' (user '%s') not defined — "
+                    "injecting restrictive fallback",
+                    ucfg.tier,
+                    uid,
                 )
+                tiers[ucfg.tier] = TierDefinition(**_restrictive.to_dict())
         return cls(
             default_tier=default_tier,
             tiers=tiers,
             users=users,
         )
+
+
+def _build_permission_tiers(
+    data: Dict[str, Any], logger
+) -> Optional["PermissionTiersConfig"]:
+    """Resolve permission_tiers from raw config data.
+
+    Returns None (feature disabled) when the block is absent or has no
+    tiers defined.  Logs a warning (F-1) when the block is present but
+    empty so the operator knows the feature is not active.
+    """
+    pt_block = data.get("permission_tiers")
+    if not pt_block:
+        return None
+    if not pt_block.get("tiers"):
+        logger.warning(
+            "permission_tiers configured but no tiers defined "
+            "— feature disabled.  Add a 'tiers:' block to enable."
+        )
+        return None
+    return PermissionTiersConfig.from_dict(pt_block)
 
 
 @dataclass
@@ -537,11 +604,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
-            permission_tiers=(
-                PermissionTiersConfig.from_dict(data["permission_tiers"])
-                if data.get("permission_tiers")
-                else None
-            ),
+            permission_tiers=_build_permission_tiers(data, logger),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -781,7 +844,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
-    
+
     telegram_fallback_ips = os.getenv("TELEGRAM_FALLBACK_IPS", "")
     if telegram_fallback_ips:
         if Platform.TELEGRAM not in config.platforms:
