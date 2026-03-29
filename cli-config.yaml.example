@@ -377,6 +377,33 @@ session_reset:
 # explicitly want one shared "room brain" per group/channel.
 group_sessions_per_user: true
 
+# =============================================================================
+# Permission Tiers (Gateway — Opt-in)
+# =============================================================================
+# Restrict tools, time windows, exec approvals, and admin commands per user.
+# If this block is absent, all users have full access (no behavior change).
+# See docs/feature-user-permissions.md for full reference.
+#
+# permission_tiers:
+#   default_tier: "restricted"       # Tier for users not listed in `users`
+#   tiers:
+#     admin:
+#       allowed_toolsets: ["*"]      # All toolsets
+#       allow_exec: true             # Can approve terminal commands
+#       allow_admin_commands: true   # Can use admin-only slash commands
+#     restricted:
+#       allowed_toolsets: ["hermes-telegram"]  # Only platform toolset
+#       allow_exec: false
+#       allow_admin_commands: false
+#       time_restrictions:           # Optional: limit to time window
+#         start: "08:00"
+#         end: "22:00"
+#         timezone: "UTC"
+#         days: [0, 1, 2, 3, 4]     # 0=Mon, 6=Sun
+#   users:
+#     "YOUR_TELEGRAM_USER_ID": { tier: "admin" }
+#     "*": { tier: "restricted" }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gateway Streaming
 # ─────────────────────────────────────────────────────────────────────────────
