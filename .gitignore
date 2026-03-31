@@ -1,3 +1,5 @@
+.audit/
+.archive/
 /venv/
 /_pycache/
 *.pyc*
@@ -58,3 +60,4 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+--
