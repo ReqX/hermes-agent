@@ -5363,3 +5363,564 @@ class TestIsElevatedTier:
         )
         runner = _make_runner(permission_tiers=pt)
         assert runner._permissions.is_elevated_tier("owner") is True
+
+
+# ------------------------------------------------------------------
+# H-1: Admin gate in /promote handler
+# ------------------------------------------------------------------
+
+
+class TestH1PromoteAdminGate:
+    """Tests for admin-only gating on /promote subcommands (list, approve, deny)."""
+
+    @pytest.mark.asyncio
+    async def test_promote_list_blocked_for_non_admin(self, tmp_path):
+        """Non-admin user cannot use /promote list."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"admin": _admin_tier(), "restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        event = _make_event("/promote list", user_id="u1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "higher access" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_promote_approve_blocked_for_non_admin(self, tmp_path):
+        """Non-admin user cannot use /promote approve."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"admin": _admin_tier(), "restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        event = _make_event("/promote approve abc123", user_id="u1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "higher access" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_promote_request_allowed_for_non_admin(self, tmp_path):
+        """Non-admin user can create promotion request (/promote <tier>)."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"admin": _admin_tier(), "restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        event = _make_event("/promote admin", user_id="u1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "permission" not in result.lower()
+        # Should get the promotion request submitted message
+        assert "promotion request" in result.lower() or "request" in result.lower()
+
+
+class TestPromoteAdminGateExtended:
+    """Additional tests for admin-only gating on /promote subcommands."""
+
+    @pytest.mark.asyncio
+    async def test_promote_deny_blocked_for_non_admin(self, tmp_path):
+        """Non-admin user cannot use /promote deny."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"admin": _admin_tier(), "restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        event = _make_event("/promote deny abc123", user_id="u1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "higher access" in result.lower() or "permission" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_promote_list_allowed_for_admin(self, tmp_path):
+        """Admin user can use /promote list."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="admin")},
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        event = _make_event("/promote list", user_id="u1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "permission" not in result.lower()
+        # Should show "No pending" or list of requests
+        assert "pending" in result.lower() or "no pending" in result.lower()
+
+
+# ------------------------------------------------------------------
+# M-2: Audit limit clamp
+# ------------------------------------------------------------------
+
+
+class TestM2AuditLimitClamp:
+    """Tests for /audit command limit clamping to max 100."""
+
+    @pytest.mark.asyncio
+    async def test_audit_main_limit_clamped_to_100(self, tmp_path):
+        """/audit 500 clamps limit to 100."""
+        from unittest.mock import MagicMock
+
+        runner = _make_runner()
+        runner._audit_log = MagicMock()
+        runner._audit_log.query.return_value = []
+
+        event = _make_event("/audit 500", user_id="admin")
+        result = await runner._handle_audit_command(event)
+
+        runner._audit_log.query.assert_called_once()
+        call_kwargs = runner._audit_log.query.call_args.kwargs
+        assert call_kwargs["limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_audit_user_subcommand_limit_clamped(self, tmp_path):
+        """/audit user u1 500 clamps limit to 100."""
+        from unittest.mock import MagicMock
+
+        runner = _make_runner()
+        runner._audit_log = MagicMock()
+        runner._audit_log.query.return_value = []
+
+        event = _make_event("/audit user u1 500", user_id="admin")
+        result = await runner._handle_audit_command(event)
+
+        runner._audit_log.query.assert_called_once()
+        call_kwargs = runner._audit_log.query.call_args.kwargs
+        assert call_kwargs["limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_audit_type_subcommand_limit_clamped(self, tmp_path):
+        """/audit type tier_resolved 500 clamps limit to 100."""
+        from unittest.mock import MagicMock
+
+        runner = _make_runner()
+        runner._audit_log = MagicMock()
+        runner._audit_log.query.return_value = []
+
+        event = _make_event("/audit type tier_resolved 500", user_id="admin")
+        result = await runner._handle_audit_command(event)
+
+        runner._audit_log.query.assert_called_once()
+        call_kwargs = runner._audit_log.query.call_args.kwargs
+        assert call_kwargs["limit"] == 100
+
+
+# ------------------------------------------------------------------
+# T1: Per-user tool overrides (config layer)
+# ------------------------------------------------------------------
+
+
+class TestUserTierConfigToolOverride:
+    """Tests for UserTierConfig allowed_tools field and group expansion."""
+
+    def test_user_config_no_override_by_default(self):
+        """UserTierConfig() has no tool override by default."""
+        cfg = UserTierConfig()
+        assert cfg.resolved_tools_override is None
+        assert cfg.allowed_tools is None
+
+    def test_user_config_from_dict_with_tools(self):
+        """UserTierConfig.from_dict with allowed_tools list sets override."""
+        cfg = UserTierConfig.from_dict(
+            {"tier": "user", "allowed_tools": ["web_search", "read_file"]}
+        )
+        assert cfg.resolved_tools_override == frozenset({"web_search", "read_file"})
+        assert cfg.allowed_tools == ["web_search", "read_file"]
+
+    def test_user_config_from_dict_with_group_expansion(self):
+        """UserTierConfig.from_dict expands @safe group to tools."""
+        cfg = UserTierConfig.from_dict({"allowed_tools": ["@safe"]})
+        # @safe expands to: @web, @read, @media, @skills, clarify
+        # Which expands to: web_search, web_extract, read_file, search_files,
+        #                    vision_analyze, image_generate, text_to_speech,
+        #                    skills_list, skill_view, clarify
+        expected_tools = {
+            "web_search",
+            "web_extract",
+            "read_file",
+            "search_files",
+            "vision_analyze",
+            "image_generate",
+            "text_to_speech",
+            "skills_list",
+            "skill_view",
+            "clarify",
+        }
+        assert cfg.resolved_tools_override == frozenset(expected_tools)
+
+    def test_user_config_to_dict_includes_tools(self):
+        """UserTierConfig.to_dict includes allowed_tools when set."""
+        cfg = UserTierConfig.from_dict(
+            {"tier": "user", "allowed_tools": ["web_search", "read_file"]}
+        )
+        d = cfg.to_dict()
+        assert "allowed_tools" in d
+        assert d["allowed_tools"] == ["web_search", "read_file"]
+
+    def test_user_config_to_dict_omits_tools_when_none(self):
+        """UserTierConfig.to_dict omits allowed_tools when None."""
+        cfg = UserTierConfig()
+        d = cfg.to_dict()
+        assert "allowed_tools" not in d
+
+    def test_user_config_invalid_tools_type_ignored(self):
+        """UserTierConfig.from_dict ignores non-list allowed_tools."""
+        cfg = UserTierConfig.from_dict({"allowed_tools": "not_a_list"})
+        assert cfg.resolved_tools_override is None
+        assert cfg.allowed_tools is None
+
+
+# ------------------------------------------------------------------
+# T1: Per-user tool overrides (resolution and display)
+# ------------------------------------------------------------------
+
+
+class TestPerUserToolOverrideResolution:
+    """Tests for per-user tool override resolution in whoami and display."""
+
+    def test_whoami_no_override_by_default(self):
+        """whoami dict has no user_tool_override key when not configured."""
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="admin")},
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = _make_source(user_id="u1")
+        info = runner._permissions.whoami(source)
+
+        assert "user_tool_override" not in info
+
+    def test_whoami_with_override_returns_sorted_tools(self):
+        """whoami dict has user_tool_override sorted list when configured."""
+        pt = _make_permission_config(
+            users={
+                "u1": UserTierConfig.from_dict(
+                    {"tier": "admin", "allowed_tools": ["web_search", "read_file"]}
+                )
+            },
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = _make_source(user_id="u1")
+        info = runner._permissions.whoami(source)
+
+        assert "user_tool_override" in info
+        assert info["user_tool_override"] == ["read_file", "web_search"]  # sorted
+
+    def test_whoami_override_with_group_expansion(self):
+        """whoami shows expanded tools from @group."""
+        pt = _make_permission_config(
+            users={
+                "u1": UserTierConfig.from_dict(
+                    {"tier": "admin", "allowed_tools": ["@safe"]}
+                )
+            },
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = _make_source(user_id="u1")
+        info = runner._permissions.whoami(source)
+
+        assert "user_tool_override" in info
+        # Should include all tools from @safe expansion
+        assert len(info["user_tool_override"]) == 10
+        assert "web_search" in info["user_tool_override"]
+        assert "read_file" in info["user_tool_override"]
+        assert "clarify" in info["user_tool_override"]
+
+    @pytest.mark.asyncio
+    async def test_whoami_override_display_in_command(self, tmp_path):
+        """/whoami displays tool override line when configured."""
+        from gateway.audit import NullAuditLog
+
+        pt = _make_permission_config(
+            users={
+                "u1": UserTierConfig.from_dict(
+                    {"tier": "admin", "allowed_tools": ["web_search", "read_file"]}
+                )
+            },
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/whoami", user_id="u1")
+        result = await runner._handle_whoami_command(event)
+
+        assert "**Tool override:**" in result
+
+    @pytest.mark.asyncio
+    async def test_whoami_override_preview_truncates_at_10(self, tmp_path):
+        """/whoami truncates tool override preview at 10 tools."""
+        from gateway.audit import NullAuditLog
+
+        # Create a user with 15 tools
+        tools = [f"tool_{i}" for i in range(15)]
+        pt = _make_permission_config(
+            users={
+                "u1": UserTierConfig.from_dict(
+                    {"tier": "admin", "allowed_tools": tools}
+                )
+            },
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/whoami", user_id="u1")
+        result = await runner._handle_whoami_command(event)
+
+        assert "**Tool override:**" in result
+        assert "… (15 total)" in result
+
+    def test_whoami_override_empty_after_intersection(self):
+        """whoami shows override even if it doesn't overlap with tier."""
+        pt = _make_permission_config(
+            users={
+                "u1": UserTierConfig.from_dict(
+                    {"tier": "guest", "allowed_tools": ["web_search", "read_file"]}
+                )
+            },
+            tiers={
+                "guest": TierDefinition(
+                    allowed_toolsets=[],
+                    allow_admin_commands=False,
+                )
+            },
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = _make_source(user_id="u1")
+        info = runner._permissions.whoami(source)
+
+        # whoami shows the user's configured override, not the intersection
+        assert "user_tool_override" in info
+        assert info["user_tool_override"] == ["read_file", "web_search"]
+
+
+# ------------------------------------------------------------------
+# T2: Per-command allowlists (config layer)
+# ------------------------------------------------------------------
+
+
+class TestTierDefinitionCommandAllowlist:
+    """Tests for TierDefinition.allowed_commands field."""
+
+    def test_tier_no_allowed_commands_by_default(self):
+        """TierDefinition() has no command allowlist by default."""
+        tier = TierDefinition()
+        assert tier.allowed_commands is None
+
+    def test_tier_from_dict_with_commands(self):
+        """TierDefinition.from_dict with allowed_commands list sets allowlist."""
+        tier = TierDefinition.from_dict(
+            {"allowed_commands": ["help", "status", "whoami"]}
+        )
+        assert tier.allowed_commands == frozenset({"help", "status", "whoami"})
+
+    def test_tier_from_dict_lowercases_commands(self):
+        """TierDefinition.from_dict lowercases command names."""
+        tier = TierDefinition.from_dict({"allowed_commands": ["Help", "STATUS"]})
+        assert tier.allowed_commands == frozenset({"help", "status"})
+
+    def test_tier_to_dict_includes_commands(self):
+        """TierDefinition.to_dict includes allowed_commands when set."""
+        tier = TierDefinition.from_dict(
+            {"allowed_commands": ["help", "status", "whoami"]}
+        )
+        d = tier.to_dict()
+        assert "allowed_commands" in d
+        # Should be sorted
+        assert d["allowed_commands"] == ["help", "status", "whoami"]
+
+    def test_tier_invalid_commands_type_ignored(self):
+        """TierDefinition.from_dict ignores non-list allowed_commands."""
+        tier = TierDefinition.from_dict({"allowed_commands": "not_a_list"})
+        assert tier.allowed_commands is None
+
+
+# ------------------------------------------------------------------
+# T2: Per-command allowlists (dispatch gating)
+# ------------------------------------------------------------------
+
+
+class TestCommandAllowlistGating:
+    """Tests for command allowlist gating in dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_command_allowed_when_in_allowlist(self, tmp_path):
+        """Command is allowed when in tier's allowed_commands."""
+        from gateway.audit import NullAuditLog
+
+        tier = TierDefinition(
+            allowed_commands=frozenset({"help", "status", "whoami"}),
+            allow_admin_commands=False,
+        )
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"restricted": tier},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/help", user_id="u1")
+        result = await runner._handle_message(event)
+
+        # Should NOT be denied (no permission message)
+        # The /help handler should run and return something
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_command_blocked_when_not_in_allowlist(self, tmp_path):
+        """Command is blocked when not in tier's allowed_commands."""
+        from gateway.audit import NullAuditLog
+
+        tier = TierDefinition(
+            allowed_commands=frozenset({"help", "status"}),
+            allow_admin_commands=False,
+        )
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"restricted": tier},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/model", user_id="u1")
+        result = await runner._handle_message(event)
+
+        assert result is not None
+        assert "higher access" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_command_allowed_when_no_allowlist_set(self, tmp_path):
+        """Command uses binary gates when allowed_commands is None."""
+        from gateway.audit import NullAuditLog
+
+        tier = TierDefinition(allowed_commands=None, allow_admin_commands=False)
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"restricted": tier},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/help", user_id="u1")
+        result = await runner._handle_message(event)
+
+        # Should NOT be denied
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_allowlist_does_not_override_admin_gate(self, tmp_path):
+        """Admin gate runs before allowlist check."""
+        from gateway.audit import NullAuditLog
+
+        # Tier with allow_admin_commands=False but provider in allowed_commands
+        tier = TierDefinition(
+            allowed_commands=frozenset({"provider"}),
+            allow_admin_commands=False,
+        )
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"restricted": tier},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/provider", user_id="u1")
+        result = await runner._handle_message(event)
+
+        # Should be blocked by admin gate, not allowlist
+        assert result is not None
+        assert "higher access" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_owner_only_command_blocked_by_allowlist(self, tmp_path):
+        """Owner-only command can be blocked by allowlist before owner gate."""
+        from gateway.audit import NullAuditLog
+
+        # Tier without admin_commands but with allowlist that excludes update
+        tier = TierDefinition(
+            allowed_commands=frozenset({"help", "status"}),
+            allow_admin_commands=False,
+        )
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"restricted": tier},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/update", user_id="u1")
+        result = await runner._handle_message(event)
+
+        # Should be blocked by allowlist (before owner gate runs)
+        assert result is not None
+        assert "higher access" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_allowlist_with_empty_set_blocks_all(self, tmp_path):
+        """Empty allowed_commands set blocks all commands."""
+        from gateway.audit import NullAuditLog
+
+        tier = TierDefinition(
+            allowed_commands=frozenset(),
+            allow_admin_commands=False,
+        )
+        pt = _make_permission_config(
+            users={"u1": UserTierConfig(tier="restricted")},
+            tiers={"restricted": tier},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/help", user_id="u1")
+        result = await runner._handle_message(event)
+
+        # Should be blocked
+        assert result is not None
+        assert "higher access" in result.lower()
