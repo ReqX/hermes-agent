@@ -22,11 +22,11 @@ from enum import Enum
 
 import sys
 from pathlib import Path as _Path
+
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
-from hermes_cli.config import get_hermes_home
 from hermes_constants import get_hermes_dir
 
 
@@ -91,6 +91,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     import asyncio
     import httpx
     import logging as _logging
+
     _log = _logging.getLogger(__name__)
 
     last_exc = None
@@ -108,12 +109,21 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
                 return cache_image_from_bytes(response.content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 last_exc = exc
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code < 429
+                ):
                     raise
                 if attempt < retries:
                     wait = 1.5 * (attempt + 1)
-                    _log.debug("Media cache retry %d/%d for %s (%.1fs): %s",
-                               attempt + 1, retries, url[:80], wait, exc)
+                    _log.debug(
+                        "Media cache retry %d/%d for %s (%.1fs): %s",
+                        attempt + 1,
+                        retries,
+                        url[:80],
+                        wait,
+                        exc,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 raise
@@ -193,6 +203,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     import asyncio
     import httpx
     import logging as _logging
+
     _log = _logging.getLogger(__name__)
 
     last_exc = None
@@ -210,12 +221,21 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
                 return cache_audio_from_bytes(response.content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 last_exc = exc
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code < 429
+                ):
                     raise
                 if attempt < retries:
                     wait = 1.5 * (attempt + 1)
-                    _log.debug("Audio cache retry %d/%d for %s (%.1fs): %s",
-                               attempt + 1, retries, url[:80], wait, exc)
+                    _log.debug(
+                        "Audio cache retry %d/%d for %s (%.1fs): %s",
+                        attempt + 1,
+                        retries,
+                        url[:80],
+                        wait,
+                        exc,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 raise
@@ -302,6 +322,7 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
 
 class MessageType(Enum):
     """Types of incoming messages."""
+
     TEXT = "text"
     LOCATION = "location"
     PHOTO = "photo"
@@ -317,39 +338,42 @@ class MessageType(Enum):
 class MessageEvent:
     """
     Incoming message from a platform.
-    
+
     Normalized representation that all adapters produce.
     """
+
     # Message content
     text: str
     message_type: MessageType = MessageType.TEXT
-    
+
     # Source information
     source: SessionSource = None
-    
+
     # Original platform data
     raw_message: Any = None
     message_id: Optional[str] = None
-    
+
     # Media attachments
     # media_urls: local file paths (for vision tool access)
     media_urls: List[str] = field(default_factory=list)
     media_types: List[str] = field(default_factory=list)
-    
+
     # Reply context
     reply_to_message_id: Optional[str] = None
-    reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
-    
+    reply_to_text: Optional[str] = (
+        None  # Text of the replied-to message (for context injection)
+    )
+
     # Auto-loaded skill for topic/channel bindings (e.g., Telegram DM Topics)
     auto_skill: Optional[str] = None
-    
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
-    
+
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.text.startswith("/")
-    
+
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""
         if not self.is_command():
@@ -360,7 +384,7 @@ class MessageEvent:
         if raw and "@" in raw:
             raw = raw.split("@", 1)[0]
         return raw
-    
+
     def get_command_args(self) -> str:
         """Get the arguments after a command."""
         if not self.is_command():
@@ -369,9 +393,10 @@ class MessageEvent:
         return parts[1] if len(parts) > 1 else ""
 
 
-@dataclass 
+@dataclass
 class SendResult:
     """Result of sending a message."""
+
     success: bool
     message_id: Optional[str] = None
     error: Optional[str] = None
@@ -403,14 +428,14 @@ MessageHandler = Callable[[MessageEvent], Awaitable[Optional[str]]]
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
-    
+
     Subclasses implement platform-specific logic for:
     - Connecting and authenticating
     - Receiving messages
     - Sending messages/responses
     - Handling media
     """
-    
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -419,8 +444,10 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
         self._fatal_error_retryable = True
-        self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
-        
+        self._fatal_error_handler: Optional[
+            Callable[["BasePlatformAdapter"], Awaitable[None] | None]
+        ] = None
+
         # Track active message handlers per session for interrupt support
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
@@ -448,7 +475,9 @@ class BasePlatformAdapter(ABC):
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
 
-    def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
+    def set_fatal_error_handler(
+        self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]
+    ) -> None:
         self._fatal_error_handler = handler
 
     def _mark_connected(self) -> None:
@@ -458,7 +487,13 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_retryable = True
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(platform=self.platform.value, platform_state="connected", error_code=None, error_message=None)
+
+            write_runtime_status(
+                platform=self.platform.value,
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+            )
         except Exception:
             pass
 
@@ -468,7 +503,13 @@ class BasePlatformAdapter(ABC):
             return
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(platform=self.platform.value, platform_state="disconnected", error_code=None, error_message=None)
+
+            write_runtime_status(
+                platform=self.platform.value,
+                platform_state="disconnected",
+                error_code=None,
+                error_message=None,
+            )
         except Exception:
             pass
 
@@ -479,6 +520,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_retryable = retryable
         try:
             from gateway.status import write_runtime_status
+
             write_runtime_status(
                 platform=self.platform.value,
                 platform_state="fatal",
@@ -495,57 +537,57 @@ class BasePlatformAdapter(ABC):
         result = handler(self)
         if asyncio.iscoroutine(result):
             await result
-    
+
     @property
     def name(self) -> str:
         """Human-readable name for this adapter."""
         return self.platform.value.title()
-    
+
     @property
     def is_connected(self) -> bool:
         """Check if adapter is currently connected."""
         return self._running
-    
+
     def set_message_handler(self, handler: MessageHandler) -> None:
         """
         Set the handler for incoming messages.
-        
+
         The handler receives a MessageEvent and should return
         an optional response string.
         """
         self._message_handler = handler
-    
+
     @abstractmethod
     async def connect(self) -> bool:
         """
         Connect to the platform and start receiving messages.
-        
+
         Returns True if connection was successful.
         """
         pass
-    
+
     @abstractmethod
     async def disconnect(self) -> None:
         """Disconnect from the platform."""
         pass
-    
+
     @abstractmethod
     async def send(
         self,
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         Send a message to a chat.
-        
+
         Args:
             chat_id: The chat/channel ID to send to
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
             metadata: Additional platform-specific options
-        
+
         Returns:
             SendResult with success status and message ID
         """
@@ -567,7 +609,7 @@ class BasePlatformAdapter(ABC):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
-        
+
         Override in subclasses if the platform supports it.
         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
@@ -580,7 +622,7 @@ class BasePlatformAdapter(ABC):
         Default is a no-op for platforms with one-shot typing indicators.
         """
         pass
-    
+
     async def send_image(
         self,
         chat_id: str,
@@ -591,7 +633,7 @@ class BasePlatformAdapter(ABC):
     ) -> SendResult:
         """
         Send an image natively via the platform API.
-        
+
         Override in subclasses to send images as proper attachments
         instead of plain-text URLs. Default falls back to sending the
         URL as a text message.
@@ -599,7 +641,7 @@ class BasePlatformAdapter(ABC):
         # Fallback: send URL as text (subclasses override for native images)
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
-    
+
     async def send_animation(
         self,
         chat_id: str,
@@ -610,67 +652,88 @@ class BasePlatformAdapter(ABC):
     ) -> SendResult:
         """
         Send an animated GIF natively via the platform API.
-        
+
         Override in subclasses to send GIFs as proper animations
         (e.g., Telegram send_animation) so they auto-play inline.
         Default falls back to send_image.
         """
-        return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
-    
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=animation_url,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     @staticmethod
     def _is_animation_url(url: str) -> bool:
         """Check if a URL points to an animated GIF (vs a static image)."""
-        lower = url.lower().split('?')[0]  # Strip query params
-        return lower.endswith('.gif')
+        lower = url.lower().split("?")[0]  # Strip query params
+        return lower.endswith(".gif")
 
     @staticmethod
     def extract_images(content: str) -> Tuple[List[Tuple[str, str]], str]:
         """
         Extract image URLs from markdown and HTML image tags in a response.
-        
+
         Finds patterns like:
         - ![alt text](https://example.com/image.png)
         - <img src="https://example.com/image.png">
         - <img src="https://example.com/image.png"></img>
-        
+
         Args:
             content: The response text to scan.
-        
+
         Returns:
             Tuple of (list of (url, alt_text) pairs, cleaned content with image tags removed).
         """
         images = []
         cleaned = content
-        
+
         # Match markdown images: ![alt](url)
-        md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
+        md_pattern = r"!\[([^\]]*)\]\((https?://[^\s\)]+)\)"
         for match in re.finditer(md_pattern, content):
             alt_text = match.group(1)
             url = match.group(2)
             # Only extract URLs that look like actual images
-            if any(url.lower().endswith(ext) or ext in url.lower() for ext in
-                   ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery']):
+            if any(
+                url.lower().endswith(ext) or ext in url.lower()
+                for ext in [
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".webp",
+                    "fal.media",
+                    "fal-cdn",
+                    "replicate.delivery",
+                ]
+            ):
                 images.append((url, alt_text))
-        
+
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
-        html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
+        html_pattern = (
+            r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
+        )
         for match in re.finditer(html_pattern, content):
             url = match.group(1)
             images.append((url, ""))
-        
+
         # Remove only the matched image tags from content (not all markdown images)
         if images:
             extracted_urls = {url for url, _ in images}
+
             def _remove_if_extracted(match):
                 url = match.group(2) if match.lastindex >= 2 else match.group(1)
-                return '' if url in extracted_urls else match.group(0)
+                return "" if url in extracted_urls else match.group(0)
+
             cleaned = re.sub(md_pattern, _remove_if_extracted, cleaned)
             cleaned = re.sub(html_pattern, _remove_if_extracted, cleaned)
             # Clean up leftover blank lines
-            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
         return images, cleaned
-    
+
     async def send_voice(
         self,
         chat_id: str,
@@ -681,7 +744,7 @@ class BasePlatformAdapter(ABC):
     ) -> SendResult:
         """
         Send an audio file as a native voice message via the platform API.
-        
+
         Override in subclasses to send audio as voice bubbles (Telegram)
         or file attachments (Discord). Default falls back to sending the
         file path as text.
@@ -768,28 +831,28 @@ class BasePlatformAdapter(ABC):
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
         Extract MEDIA:<path> tags and [[audio_as_voice]] directives from response text.
-        
+
         The TTS tool returns responses like:
             [[audio_as_voice]]
             MEDIA:/path/to/audio.ogg
-        
+
         Args:
             content: The response text to scan.
-        
+
         Returns:
             Tuple of (list of (path, is_voice) pairs, cleaned content with tags removed).
         """
         media = []
         cleaned = content
-        
+
         # Check for [[audio_as_voice]] directive
         has_voice_tag = "[[audio_as_voice]]" in content
         cleaned = cleaned.replace("[[audio_as_voice]]", "")
-        
+
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r"""[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?"""
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -801,9 +864,9 @@ class BasePlatformAdapter(ABC):
 
         # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
         if media:
-            cleaned = media_pattern.sub('', cleaned)
-            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        
+            cleaned = media_pattern.sub("", cleaned)
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
         return media, cleaned
 
     @staticmethod
@@ -824,24 +887,32 @@ class BasePlatformAdapter(ABC):
             raw path strings removed).
         """
         _LOCAL_MEDIA_EXTS = (
-            '.png', '.jpg', '.jpeg', '.gif', '.webp',
-            '.mp4', '.mov', '.avi', '.mkv', '.webm',
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".mp4",
+            ".mov",
+            ".avi",
+            ".mkv",
+            ".webm",
         )
-        ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
+        ext_part = "|".join(e.lstrip(".") for e in _LOCAL_MEDIA_EXTS)
 
         # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
         #             and relative paths (./foo.png)
         # (?:~/|/)    anchors to absolute or home-relative paths
         path_re = re.compile(
-            r'(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:' + ext_part + r')\b',
+            r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + ext_part + r")\b",
             re.IGNORECASE,
         )
 
         # Build spans covered by fenced code blocks and inline code
         code_spans: list = []
-        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+        for m in re.finditer(r"```[^\n]*\n.*?```", content, re.DOTALL):
             code_spans.append((m.start(), m.end()))
-        for m in re.finditer(r'`[^`\n]+`', content):
+        for m in re.finditer(r"`[^`\n]+`", content):
             code_spans.append((m.start(), m.end()))
 
         def _in_code(pos: int) -> bool:
@@ -869,15 +940,17 @@ class BasePlatformAdapter(ABC):
         cleaned = content
         if unique:
             for raw, _exp in unique:
-                cleaned = cleaned.replace(raw, '')
-            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+                cleaned = cleaned.replace(raw, "")
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
         return paths, cleaned
 
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
+    async def _keep_typing(
+        self, chat_id: str, interval: float = 2.0, metadata=None
+    ) -> None:
         """
         Continuously send typing indicator until cancelled.
-        
+
         Telegram/Discord typing status expires after ~5 seconds, so we refresh every 2
         to recover quickly after progress messages interrupt it.
         """
@@ -897,7 +970,7 @@ class BasePlatformAdapter(ABC):
                     await self.stop_typing(chat_id)
                 except Exception:
                     pass
-    
+
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events
     # (e.g. Discord adds 👀/✅/❌ reactions).
@@ -908,7 +981,9 @@ class BasePlatformAdapter(ABC):
     async def on_processing_complete(self, event: MessageEvent, success: bool) -> None:
         """Hook called when background processing completes."""
 
-    async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
+    async def _run_processing_hook(
+        self, hook_name: str, *args: Any, **kwargs: Any
+    ) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
         if not callable(hook):
@@ -963,7 +1038,11 @@ class BasePlatformAdapter(ABC):
                 delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
-                    self.name, attempt, max_retries, delay, error_str,
+                    self.name,
+                    attempt,
+                    max_retries,
+                    delay,
+                    error_str,
                 )
                 await asyncio.sleep(delay)
                 result = await self.send(
@@ -980,19 +1059,35 @@ class BasePlatformAdapter(ABC):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user
-                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
+                logger.error(
+                    "[%s] Failed to deliver response after %d retries: %s",
+                    self.name,
+                    max_retries,
+                    error_str,
+                )
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    await self.send(
+                        chat_id=chat_id,
+                        content=notice,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
                 except Exception as notify_err:
-                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
+                    logger.debug(
+                        "[%s] Could not send delivery-failure notice: %s",
+                        self.name,
+                        notify_err,
+                    )
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
-        logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        logger.warning(
+            "[%s] Send failed: %s — trying plain-text fallback", self.name, error_str
+        )
         fallback_result = await self.send(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
@@ -1000,32 +1095,40 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
         if not fallback_result.success:
-            logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
+            logger.error(
+                "[%s] Fallback send also failed: %s", self.name, fallback_result.error
+            )
         return fallback_result
 
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
         """
         if not self._message_handler:
             return
-        
+
         session_key = build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
         )
-        
+
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
-                logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
+                logger.debug(
+                    "[%s] Queuing photo follow-up for session %s without interrupt",
+                    self.name,
+                    session_key,
+                )
                 existing = self._pending_messages.get(session_key)
                 if existing and existing.message_type == MessageType.PHOTO:
                     existing.media_urls.extend(event.media_urls)
@@ -1040,12 +1143,16 @@ class BasePlatformAdapter(ABC):
                 return  # Don't interrupt now - will run after current task completes
 
             # Default behavior for non-photo follow-ups: interrupt the running agent
-            logger.debug("[%s] New message while session %s is active — triggering interrupt", self.name, session_key)
+            logger.debug(
+                "[%s] New message while session %s is active — triggering interrupt",
+                self.name,
+                session_key,
+            )
             self._pending_messages[session_key] = event
             # Signal the interrupt (the processing task checks this)
             self._active_sessions[session_key].set()
             return  # Don't process now - will be handled after current task finishes
-        
+
         # Spawn background task to process this message
         task = asyncio.create_task(self._process_message_background(event, session_key))
         try:
@@ -1056,7 +1163,7 @@ class BasePlatformAdapter(ABC):
             return
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
-    
+
     @staticmethod
     def _get_human_delay() -> float:
         """
@@ -1078,7 +1185,9 @@ class BasePlatformAdapter(ABC):
             min_ms, max_ms = 800, 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
-    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
@@ -1095,50 +1204,76 @@ class BasePlatformAdapter(ABC):
         # Create interrupt event for this session
         interrupt_event = asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
-        
+
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
-        
+        _thread_metadata = (
+            {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        )
+        typing_task = asyncio.create_task(
+            self._keep_typing(event.source.chat_id, metadata=_thread_metadata)
+        )
+
         try:
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            
+
             # Send response if any
             if not response:
-                logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+                logger.warning(
+                    "[%s] Handler returned empty/None response for %s",
+                    self.name,
+                    event.source.chat_id,
+                )
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                
+
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
                 # Strip any remaining internal directives from message body (fixes #1561)
                 text_content = text_content.replace("[[audio_as_voice]]", "").strip()
                 text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
                 if images:
-                    logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+                    logger.info(
+                        "[%s] extract_images found %d image(s) in response (%d chars)",
+                        self.name,
+                        len(images),
+                        len(response),
+                    )
 
                 # Auto-detect bare local file paths for native media delivery
                 # (helps small models that don't use MEDIA: syntax)
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
-                    logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
-                
+                    logger.info(
+                        "[%s] extract_local_files found %d file(s) in response",
+                        self.name,
+                        len(local_files),
+                    )
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Skipped when the chat has voice mode disabled (/voice off)
                 _tts_path = None
-                if (event.message_type == MessageType.VOICE
-                        and text_content
-                        and not media_files
-                        and event.source.chat_id not in self._auto_tts_disabled_chats):
+                if (
+                    event.message_type == MessageType.VOICE
+                    and text_content
+                    and not media_files
+                    and event.source.chat_id not in self._auto_tts_disabled_chats
+                ):
                     try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                        from tools.tts_tool import (
+                            text_to_speech_tool,
+                            check_tts_requirements,
+                        )
+
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+
+                            speech_text = re.sub(r"[*_`#\[\]()]", "", text_content)[
+                                :4000
+                            ].strip()
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
                             tts_result_str = await asyncio.to_thread(
@@ -1165,7 +1300,12 @@ class BasePlatformAdapter(ABC):
 
                 # Send the text portion
                 if text_content:
-                    logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                    logger.info(
+                        "[%s] Sending response (%d chars) to %s",
+                        self.name,
+                        len(text_content),
+                        event.source.chat_id,
+                    )
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
@@ -1179,12 +1319,21 @@ class BasePlatformAdapter(ABC):
 
                 # Send extracted images as native attachments
                 if images:
-                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
+                    logger.info(
+                        "[%s] Extracted %d image(s) to send as attachments",
+                        self.name,
+                        len(images),
+                    )
                 for image_url, alt_text in images:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        logger.info("[%s] Sending image: %s (alt=%s)", self.name, image_url[:80], alt_text[:30] if alt_text else "")
+                        logger.info(
+                            "[%s] Sending image: %s (alt=%s)",
+                            self.name,
+                            image_url[:80],
+                            alt_text[:30] if alt_text else "",
+                        )
                         # Route animated GIFs through send_animation for proper playback
                         if self._is_animation_url(image_url):
                             img_result = await self.send_animation(
@@ -1201,14 +1350,23 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
                         if not img_result.success:
-                            logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                            logger.error(
+                                "[%s] Failed to send image: %s",
+                                self.name,
+                                img_result.error,
+                            )
                     except Exception as img_err:
-                        logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                        logger.error(
+                            "[%s] Error sending image: %s",
+                            self.name,
+                            img_err,
+                            exc_info=True,
+                        )
 
                 # Send extracted media files — route by file type
-                _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
-                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+                _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
+                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+                _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
                 for media_path, is_voice in media_files:
                     if human_delay > 0:
@@ -1241,9 +1399,16 @@ class BasePlatformAdapter(ABC):
                             )
 
                         if not media_result.success:
-                            logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            logger.warning(
+                                "[%s] Failed to send media (%s): %s",
+                                self.name,
+                                ext,
+                                media_result.error,
+                            )
                     except Exception as media_err:
-                        logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        logger.warning(
+                            "[%s] Error sending media: %s", self.name, media_err
+                        )
 
                 # Send auto-detected local files as native attachments
                 for file_path in local_files:
@@ -1270,11 +1435,20 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
                     except Exception as file_err:
-                        logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        logger.error(
+                            "[%s] Error sending local file %s: %s",
+                            self.name,
+                            file_path,
+                            file_err,
+                        )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
-            await self._run_processing_hook("on_processing_complete", event, processing_ok)
+            processing_ok = (
+                delivery_succeeded if delivery_attempted else not bool(response)
+            )
+            await self._run_processing_hook(
+                "on_processing_complete", event, processing_ok
+            )
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
@@ -1291,7 +1465,7 @@ class BasePlatformAdapter(ABC):
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up
-                
+
         except asyncio.CancelledError:
             await self._run_processing_hook("on_processing_complete", event, False)
             raise
@@ -1302,7 +1476,11 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                _thread_metadata = (
+                    {"thread_id": event.source.thread_id}
+                    if event.source.thread_id
+                    else None
+                )
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -1331,7 +1509,7 @@ class BasePlatformAdapter(ABC):
             # Clean up session tracking
             if session_key in self._active_sessions:
                 del self._active_sessions[session_key]
-    
+
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.
 
@@ -1349,12 +1527,15 @@ class BasePlatformAdapter(ABC):
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
-        return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
-    
+        return (
+            session_key in self._active_sessions
+            and self._active_sessions[session_key].is_set()
+        )
+
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
-    
+
     def build_source(
         self,
         chat_id: str,
@@ -1366,6 +1547,7 @@ class BasePlatformAdapter(ABC):
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
+        user_roles: Optional[List[str]] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -1382,30 +1564,31 @@ class BasePlatformAdapter(ABC):
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
+            user_roles=user_roles,
         )
-    
+
     @abstractmethod
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """
         Get information about a chat/channel.
-        
+
         Returns dict with at least:
         - name: Chat name
         - type: "dm", "group", "channel"
         """
         pass
-    
+
     def format_message(self, content: str) -> str:
         """
         Format a message for this platform.
-        
+
         Override in subclasses to handle platform-specific formatting
         (e.g., Telegram MarkdownV2, Discord markdown).
-        
+
         Default implementation returns content as-is.
         """
         return content
-    
+
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096) -> List[str]:
         """
@@ -1426,7 +1609,7 @@ class BasePlatformAdapter(ABC):
         if len(content) <= max_length:
             return [content]
 
-        INDICATOR_RESERVE = 10   # room for " (XX/XX)"
+        INDICATOR_RESERVE = 10  # room for " (XX/XX)"
         FENCE_CLOSE = "\n```"
 
         chunks: List[str] = []
@@ -1512,8 +1695,6 @@ class BasePlatformAdapter(ABC):
         # Append chunk indicators when the response spans multiple messages
         if len(chunks) > 1:
             total = len(chunks)
-            chunks = [
-                f"{chunk} ({i + 1}/{total})" for i, chunk in enumerate(chunks)
-            ]
+            chunks = [f"{chunk} ({i + 1}/{total})" for i, chunk in enumerate(chunks)]
 
         return chunks

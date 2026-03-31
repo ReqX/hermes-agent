@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -223,9 +224,6 @@ from gateway.config import (
     Platform,
     GatewayConfig,
     load_gateway_config,
-    TimeRestrictions,
-    TierDefinition,
-    PermissionTiersConfig,
 )
 from gateway.session import (
     SessionStore,
@@ -410,25 +408,7 @@ class GatewayRunner:
         )
         self.delivery_router = DeliveryRouter(self.config)
 
-    @property
-    def _permissions(self):
-        """Lazy-initialized PermissionManager.
-
-        Tests that bypass __init__ with object.__new__() won't have
-        _permissions set — this property creates it on first access.
-        """
-        from gateway.permissions import PermissionManager, RuntimeUserStore
-
-        pt = getattr(getattr(self, "config", None), "permission_tiers", None)
-        # RuntimeUserStore is only created when permission tiers are active
-        runtime_store = RuntimeUserStore() if pt is not None else None
-        pairing_store = getattr(self, "pairing_store", None)
-        mgr = PermissionManager(
-            pt, runtime_store=runtime_store, pairing_store=pairing_store
-        )
-        # Cache directly in __dict__ to bypass the property descriptor
-        self.__dict__["_permissions"] = mgr
-        return mgr
+        # Runtime state
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -436,39 +416,29 @@ class GatewayRunner:
         self._exit_reason: Optional[str] = None
 
         # Track running agents per session for interrupt support
-        # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
-        self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._pending_messages: Dict[str, str] = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
         # system prompt (including memory) every turn — breaking prefix cache
         # and costing ~10x more on providers with prompt caching (Anthropic).
-        # Key: session_key, Value: (AIAgent, config_signature_str)
         import threading as _threading
 
         self._agent_cache: Dict[str, tuple] = {}
         self._agent_cache_lock = _threading.Lock()
 
         # Track active fallback model/provider when primary is rate-limited.
-        # Set after an agent run where fallback was activated; cleared when
-        # the primary model succeeds again or the user switches via /model.
         self._effective_model: Optional[str] = None
         self._effective_provider: Optional[str] = None
 
-        # Track pending exec approvals per session+user.
-        # Key: _approval_key(session_key, source) — either session_key (no tiers)
-        # or (session_key, user_id) when tiers are active. This prevents a
-        # different user in the same session from approving another's command.
-        self._pending_approvals: Dict[Any, Dict[str, Any]] = {}
+        # Track pending exec approvals per session
+        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
         # Track platforms that failed to connect for background reconnection.
-        # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
 
         # Persistent Honcho managers keyed by gateway session key.
-        # This preserves write_frequency="session" semantics across short-lived
-        # per-message AIAgent instances.
         self._honcho_managers: Dict[str, Any] = {}
         self._honcho_configs: Dict[str, Any] = {}
 
@@ -504,6 +474,87 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+    @functools.cached_property
+    def _permissions(self):
+        """Lazy-initialized PermissionManager (cached per-instance).
+
+        Uses functools.cached_property (non-data descriptor) so the first
+        access creates and caches the PermissionManager in __dict__;
+        subsequent accesses return from __dict__ directly. This ensures
+        state (injected stores, runtime overrides) persists across calls.
+
+        Tests that bypass __init__ with object.__new__() get a fresh manager
+        on first access — same behavior as before, but now properly cached.
+        """
+        from gateway.permissions import PermissionManager, RuntimeUserStore
+
+        pt = getattr(getattr(self, "config", None), "permission_tiers", None)
+        # RuntimeUserStore is only created when permission tiers are active
+        runtime_store = RuntimeUserStore() if pt is not None else None
+        pairing_store = getattr(self, "pairing_store", None)
+        return PermissionManager(
+            pt, runtime_store=runtime_store, pairing_store=pairing_store
+        )
+
+    @functools.cached_property
+    def _audit_log(self):
+        """Lazy-initialized audit log (T5).
+
+        Returns AuditLog when audit is configured, NullAuditLog otherwise.
+        """
+        from gateway.audit import AuditLog, NullAuditLog
+
+        import os
+
+        from hermes_constants import get_hermes_home
+
+        pt = getattr(getattr(self, "config", None), "permission_tiers", None)
+        audit_cfg = getattr(pt, "audit", None) if pt else None
+        if audit_cfg:
+            db_path = audit_cfg.get("db_path")
+            if db_path:
+                db_path = os.path.join(str(get_hermes_home()), db_path)
+            max_rows = audit_cfg.get("max_rows", 100_000)
+            return AuditLog(db_path=db_path, max_rows=max_rows)
+        return NullAuditLog()
+
+    @functools.cached_property
+    def _usage_store(self):
+        """Lazy-initialized usage store (T6).
+
+        Returns UsageStore when usage_tracking is configured, NullUsageStore otherwise.
+        """
+        from gateway.usage import UsageStore, NullUsageStore
+        import os
+
+        from hermes_constants import get_hermes_home
+
+        pt = getattr(getattr(self, "config", None), "permission_tiers", None)
+        usage_cfg = getattr(pt, "usage_tracking", None) if pt else None
+        if usage_cfg:
+            db_path = usage_cfg.get("db_path")
+            if db_path:
+                db_path = os.path.join(str(get_hermes_home()), db_path)
+            return UsageStore(db_path=db_path)
+        return NullUsageStore()
+
+    @functools.cached_property
+    def _promote_store(self):
+        """Lazy-initialized promote request store (T7d)."""
+        from gateway.permissions import PromoteRequestStore
+
+        pt = getattr(getattr(self, "config", None), "permission_tiers", None)
+        if pt is None:
+            return PromoteRequestStore()  # Uses default path
+        db_path_override = None
+        if pt and hasattr(pt, "promote_store_path"):
+            db_path_override = pt.promote_store_path
+        if db_path_override:
+            from pathlib import Path as P
+
+            return PromoteRequestStore(db_path=str(P(db_path_override)))
+        return PromoteRequestStore()
 
     def _get_or_create_gateway_honcho(self, session_key: str):
         """Return a persistent Honcho manager/config pair for this gateway session."""
@@ -1933,9 +1984,25 @@ class GatewayRunner:
             return None
 
         # --- Permission tier: resolve once, reuse everywhere below ---
+        # Step 0: Platform role mapping (T3/T4) — check user_roles → tier
+        _platform_role_tier = self._permissions.resolve_platform_role_tier(source)
+
         _msg_tier_name = self._permissions.resolve_user_tier(source)
+        # Override with platform role tier if resolved (takes precedence)
+        if _platform_role_tier is not None:
+            _msg_tier_name = _platform_role_tier
+
         _msg_tier_cfg = self._permissions.get_tier_config(_msg_tier_name)
         _msg_user_cfg = self._permissions.resolve_user_cfg(source)
+
+        # Audit: tier resolved (T5)
+        self._audit_log.log(
+            event_type="tier_resolved",
+            platform=source.platform.value if source.platform else None,
+            user_id=source.user_id,
+            tier_name=_msg_tier_name,
+            details=f"source={getattr(source, 'chat_type', 'unknown')}",
+        )
 
         # Time restriction check (opt-in)
         if _msg_tier_cfg is not None and _msg_tier_cfg.time_restrictions is not None:
@@ -1943,6 +2010,13 @@ class GatewayRunner:
                 _msg_tier_cfg
             )
             if not _time_ok:
+                self._audit_log.log(
+                    event_type="time_restricted",
+                    platform=source.platform.value if source.platform else None,
+                    user_id=source.user_id,
+                    tier_name=_msg_tier_name,
+                    details=f"reason={_time_reason}",
+                )
                 return self._permissions.format_tier_message(
                     _msg_tier_cfg,
                     _time_reason,
@@ -1953,6 +2027,13 @@ class GatewayRunner:
         # Rate limit check (opt-in)
         _rate_ok, _rate_reason = self._permissions.check_rate_limit(source)
         if not _rate_ok:
+            self._audit_log.log(
+                event_type="rate_limited",
+                platform=source.platform.value if source.platform else None,
+                user_id=source.user_id,
+                tier_name=_msg_tier_name,
+                details=f"reason={_rate_reason}",
+            )
             if _msg_tier_cfg is not None:
                 return self._permissions.format_tier_message(
                     _msg_tier_cfg,
@@ -2153,6 +2234,13 @@ class GatewayRunner:
         }
         if canonical in _tiered_admin_commands:
             if _msg_tier_cfg is not None and not _msg_tier_cfg.allow_admin_commands:
+                self._audit_log.log(
+                    event_type="command_denied",
+                    platform=source.platform.value if source.platform else None,
+                    user_id=source.user_id,
+                    tier_name=_msg_tier_name,
+                    details=f"command={canonical}",
+                )
                 return self._permissions.format_tier_message(
                     _msg_tier_cfg,
                     "command_denied",
@@ -2170,6 +2258,13 @@ class GatewayRunner:
                 and self._permissions.active
                 and _msg_tier_name != self._permissions.owner_tier_name
             ):
+                self._audit_log.log(
+                    event_type="command_denied",
+                    platform=source.platform.value if source.platform else None,
+                    user_id=source.user_id,
+                    tier_name=_msg_tier_name,
+                    details=f"command={canonical} (owner-only)",
+                )
                 return self._permissions.format_tier_message(
                     _msg_tier_cfg,
                     "command_denied",
@@ -2276,6 +2371,12 @@ class GatewayRunner:
 
         if canonical == "users":
             return await self._handle_users_command(event)
+
+        if canonical == "promote":
+            return await self._handle_promote_command(event)
+
+        if canonical == "audit":
+            return await self._handle_audit_command(event)
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -3892,7 +3993,6 @@ class GatewayRunner:
             lines.append(f"**Platform:** {info['platform']}")
 
         tier_name = info["tier_name"]
-        tier_cfg = self._permissions.get_tier_config(tier_name)
         tier_source = info["tier_source"]
 
         source_labels = {
@@ -4025,6 +4125,213 @@ class GatewayRunner:
         if success:
             return f"✅ {message}"
         return f"❌ {message}"
+
+    # ------------------------------------------------------------------
+    # /promote command (T7d)
+    # ------------------------------------------------------------------
+
+    async def _handle_promote_command(self, event: MessageEvent) -> str:
+        """Handle /promote — request tier promotion or manage requests.
+
+        Subcommands:
+        - /promote <tier>          — request promotion (any user)
+        - /promote list            — list pending requests (admin only)
+        - /promote approve <id>    — approve a request (admin only)
+        - /promote deny <id>       — deny a request (admin only)
+        """
+        source = event.source
+        args = event.get_command_args().strip().split()
+
+        if not args:
+            return (
+                "**Usage:**\n"
+                "• `/promote <tier>` — request tier promotion\n"
+                "• `/promote list` — view pending requests (admin)\n"
+                "• `/promote approve <id>` — approve request (admin)\n"
+                "• `/promote deny <id>` — deny request (admin)"
+            )
+
+        subcmd = args[0].lower()
+
+        # --- /promote list (admin only) ---
+        if subcmd == "list":
+            pending = self._promote_store.list_pending()
+            if not pending:
+                return "No pending promotion requests."
+            lines = ["📋 **Pending Promotion Requests**", ""]
+            for req in pending:
+                req_id = req["id"]
+                uid = req["user_id"]
+                tier = req["requested_tier"]
+                lines.append(f"• `#{req_id}` — `{uid}` → **{tier}**")
+            return "\n".join(lines)
+
+        # --- /promote approve <id> (admin only) ---
+        if subcmd == "approve":
+            if len(args) < 2:
+                return "Usage: `/promote approve <request_id>`"
+            request_id = args[1]
+            req = self._promote_store.get_request(request_id)
+            if not req:
+                return f"Request `{request_id}` not found."
+            if req["status"] != "pending":
+                return f"Request `{request_id}` is already {req['status']}."
+
+            # Approve: set user tier + mark approved
+            admin_id = getattr(source, "user_id", "system")
+            success, msg = self._permissions.set_user_tier(
+                req["user_id"],
+                req["requested_tier"],
+                granted_by=admin_id,
+                source_platform=(source.platform.value if source.platform else None),
+            )
+            if success:
+                self._promote_store.approve_request(request_id, approved_by=admin_id)
+                self._audit_log.log(
+                    event_type="promote_approved",
+                    platform=source.platform.value if source.platform else None,
+                    user_id=req["user_id"],
+                    tier_name=req["requested_tier"],
+                    details=f"approved_by={admin_id}",
+                )
+                return f"✅ Approved: `{req['user_id']}` → **{req['requested_tier']}**"
+            return f"❌ Failed to set tier: {msg}"
+
+        # --- /promote deny <id> (admin only) ---
+        if subcmd == "deny":
+            if len(args) < 2:
+                return "Usage: `/promote deny <request_id>`"
+            request_id = args[1]
+            req = self._promote_store.get_request(request_id)
+            if not req:
+                return f"Request `{request_id}` not found."
+            if req["status"] != "pending":
+                return f"Request `{request_id}` is already {req['status']}."
+
+            admin_id = getattr(source, "user_id", "system")
+            self._promote_store.deny_request(request_id, denied_by=admin_id)
+            self._audit_log.log(
+                event_type="promote_denied",
+                platform=source.platform.value if source.platform else None,
+                user_id=req["user_id"],
+                tier_name=req["requested_tier"],
+                details=f"denied_by={admin_id}",
+            )
+            return f"❌ Denied promotion request for `{req['user_id']}`."
+
+        # --- /promote <tier> — create promotion request ---
+        requested_tier = subcmd
+        user_id = getattr(source, "user_id", None)
+        if not user_id:
+            return "Cannot determine your user ID for this request."
+
+        # Validate tier exists
+        if self._permissions.config is None:
+            return "Permission tiers are not configured."
+        if requested_tier not in self._permissions.config.tiers:
+            available = ", ".join(sorted(self._permissions.config.tiers.keys()))
+            return f"Unknown tier `{requested_tier}`. Available: {available}"
+
+        # Check if user already has this tier or higher
+        current_tier = self._permissions.resolve_user_tier(source)
+        if current_tier == requested_tier:
+            return f"You already have the **{requested_tier}** tier."
+
+        result = self._promote_store.create_request(
+            user_id=user_id,
+            platform=source.platform.value if source.platform else None,
+            requested_tier=requested_tier,
+            current_tier=current_tier or "default",
+        )
+        if result is None:
+            return "You already have a pending promotion request."
+
+        request_id = result["id"]
+        self._audit_log.log(
+            event_type="promote_requested",
+            platform=source.platform.value if source.platform else None,
+            user_id=user_id,
+            tier_name=requested_tier,
+            details=f"request_id={request_id}",
+        )
+        return (
+            f"📝 Promotion request submitted!\n"
+            f"Request ID: `#{request_id[:8]}`\n"
+            f"Requested tier: **{requested_tier}**\n"
+            f"An admin will review your request."
+        )
+
+    # ------------------------------------------------------------------
+    # /audit command (T5)
+    # ------------------------------------------------------------------
+
+    async def _handle_audit_command(self, event: MessageEvent) -> str:
+        """Handle /audit — query audit log.
+
+        Subcommands:
+        - /audit [N]               — show last N events (default 10)
+        - /audit user <user_id>     — filter by user
+        - /audit type <event_type>  — filter by event type
+        - /audit stats              — show event counts
+        """
+        args = event.get_command_args().strip().split()
+
+        if not args or args[0].isdigit():
+            limit = int(args[0]) if args and args[0].isdigit() else 10
+            events = self._audit_log.query(limit=limit)
+            if not events:
+                return "No audit events found."
+            lines = [f"📜 **Last {len(events)} Audit Events**", ""]
+            for ev in events:
+                ts = ev.get("timestamp", "?")
+                etype = ev.get("event_type", "?")
+                uid = ev.get("user_id", "?") or "—"
+                tier = ev.get("tier_name", "?") or "—"
+                details = ev.get("details", "")
+                lines.append(f"[{ts}] **{etype}** user=`{uid}` tier={tier} {details}")
+            return "\n".join(lines)
+
+        subcmd = args[0].lower()
+
+        if subcmd == "user" and len(args) >= 2:
+            target_user = args[1]
+            limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+            events = self._audit_log.query(user_id=target_user, limit=limit)
+            if not events:
+                return f"No audit events for user `{target_user}`."
+            lines = [f"📜 **Audit for `{target_user}`** ({len(events)} events)", ""]
+            for ev in events:
+                ts = ev.get("timestamp", "?")
+                etype = ev.get("event_type", "?")
+                details = ev.get("details", "")
+                lines.append(f"[{ts}] **{etype}** {details}")
+            return "\n".join(lines)
+
+        if subcmd == "type" and len(args) >= 2:
+            event_type = args[1]
+            limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+            events = self._audit_log.query(event_type=event_type, limit=limit)
+            if not events:
+                return f"No audit events of type `{event_type}`."
+            lines = [f"📜 **Audit: {event_type}** ({len(events)} events)", ""]
+            for ev in events:
+                ts = ev.get("timestamp", "?")
+                uid = ev.get("user_id", "?") or "—"
+                details = ev.get("details", "")
+                lines.append(f"[{ts}] user=`{uid}` {details}")
+            return "\n".join(lines)
+
+        if subcmd == "stats":
+            total = self._audit_log.count()
+            return f"📊 **Audit Log Stats**\nTotal events: {total}"
+
+        return (
+            "**Usage:**\n"
+            "• `/audit [N]` — show last N events\n"
+            "• `/audit user <user_id>` — filter by user\n"
+            "• `/audit type <event_type>` — filter by type\n"
+            "• `/audit stats` — show event counts"
+        )
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
@@ -5915,6 +6222,28 @@ class GatewayRunner:
                     # Fail closed: if we can't enumerate tools, deny everything
                     _allowed_tool_names = frozenset()
 
+        # --- T7c: MCP default-deny for non-elevated tiers ---
+        # MCP tools are powerful (arbitrary API calls, database access, etc.).
+        # By default, only elevated tiers (admin/owner with @mcp or wildcard)
+        # get MCP access. Non-elevated tiers have mcp:* tools stripped.
+        if _tier_cfg is not None and not self._permissions.is_elevated_tier(_tier_name):
+            if _allowed_tool_names is not None:
+                # Remove any tool names matching mcp:* pattern
+                _allowed_tool_names = frozenset(
+                    n for n in _allowed_tool_names if not n.startswith("mcp:")
+                )
+            else:
+                # No tool-level allowlist — build from all tools minus mcp:*
+                try:
+                    from tools.registry import registry as _tr
+
+                    _all_names = frozenset(_tr.get_all_tool_names())
+                    _allowed_tool_names = frozenset(
+                        n for n in _all_names if not n.startswith("mcp:")
+                    )
+                except Exception:
+                    pass  # Fail open here — MCP tools are still gated by schema
+
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility.
         # YAML 1.1 parses bare `off` as boolean False — normalise before
@@ -6534,6 +6863,26 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
+
+            # T6: Record token usage for the user (non-blocking)
+            if _input_toks > 0 or _output_toks > 0:
+                try:
+                    _track_user_id = getattr(source, "user_id", None)
+                    _track_platform = (
+                        source.platform.value
+                        if source and source.platform
+                        else "unknown"
+                    )
+                    if _track_user_id:
+                        self._usage_store.record_tokens(
+                            platform=_track_platform,
+                            user_id=_track_user_id,
+                            input_tokens=_input_toks,
+                            output_tokens=_output_toks,
+                            model=_resolved_model,
+                        )
+                except Exception:
+                    pass  # Non-fatal — usage tracking best-effort
 
             return {
                 "final_response": final_response,

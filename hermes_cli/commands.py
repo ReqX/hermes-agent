@@ -272,6 +272,22 @@ COMMAND_REGISTRY: list[CommandDef] = [
         args_hint="[list|set|remove]",
         subcommands=("list", "set", "remove"),
     ),
+    CommandDef(
+        "promote",
+        "Request or manage tier promotions",
+        "Info",
+        gateway_only=True,
+        args_hint="[<tier>|list|approve <id>|deny <id>]",
+        subcommands=("list", "approve", "deny"),
+    ),
+    CommandDef(
+        "audit",
+        "View permission audit log (admin only)",
+        "Info",
+        gateway_only=True,
+        admin_only=True,
+        args_hint="[<user_id>]",
+    ),
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit", cli_only=True, aliases=("exit", "q")),
 ]

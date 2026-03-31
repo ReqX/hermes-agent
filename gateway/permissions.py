@@ -14,21 +14,19 @@ This module is the sole authority for:
 - Runtime user management (set/remove/list tiers)
 """
 
-import json
 import logging
 import sqlite3
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from gateway.config import (
     PLATFORM_ALLOW_ALL_ENV,
     PLATFORM_ALLOWED_USERS_ENV,
     PermissionTiersConfig,
-    Platform,
     TierDefinition,
     UserTierConfig,
 )
@@ -299,7 +297,6 @@ class PermissionManager:
                 self._config.users[composite_key] = UserTierConfig(tier=tier_name)
             # Log the auto-promoted owner
             if ids:
-                composite_owner = f"{platform.value}:{ids[0]}"
                 logger.info(
                     "Auto-tier: %s first entry '%s' → %s",
                     env_var,
@@ -670,15 +667,26 @@ class PermissionManager:
             return template
 
         fallbacks = {
-            "exec_denied": "You don't have permission to approve or deny commands.",
-            "command_denied": "That command is only available to admins.",
+            "exec_denied": (
+                "You don't have permission to approve terminal commands. "
+                "Ask an admin to approve it, or use /whoami to check your access level."
+            ),
+            "command_denied": (
+                "This command requires higher access. Use /whoami to see your "
+                "available commands, or ask an admin to run it for you."
+            ),
             "time_restricted_before": f"Access starts at {tr.start if tr else '08:00'}.",
             "time_restricted_after": f"Access ended at {tr.end if tr else '22:00'}.",
             "time_restricted_wrong_day": "Not available today.",
-            "rate_limited": "Rate limit exceeded. Please try again later.",
+            "rate_limited": (
+                "You've reached your message limit for this hour. "
+                "Your limit will reset soon — please try again later."
+            ),
             "rate_limited_blocked": "Access is currently restricted.",
         }
-        return fallbacks.get(key, "Permission denied.")
+        return fallbacks.get(
+            key, "Access restricted. Use /whoami to check your permissions."
+        )
 
     # ------------------------------------------------------------------
     # Approval key isolation
@@ -1000,4 +1008,338 @@ class PermissionManager:
         if tier_cfg.requests_per_hour is not None:
             parts.append(f"Rate limit: {tier_cfg.requests_per_hour} requests per hour.")
 
+        # Helpful denial behavioral guidance (T7e)
+        parts.append(
+            "When a user asks you to do something you can't do with your current tools:\n"
+            "1. Acknowledge the request positively\n"
+            "2. Explain what you CAN do instead (using your available tools)\n"
+            "3. If possible, offer step-by-step instructions the user can follow themselves\n"
+            "4. Suggest they ask an admin if the task requires elevated access\n"
+            "Never just say 'denied' or 'I can't' — always offer a helpful alternative."
+        )
+
         return "\n".join(parts) if parts else None
+
+    # ------------------------------------------------------------------
+    # Platform role mapping (T3/T4)
+    # ------------------------------------------------------------------
+
+    def resolve_platform_role_tier(self, source) -> Optional[str]:
+        """Resolve tier from platform-specific roles (Telegram admin, Discord roles).
+
+        Checks the platform_role_mapping config section for matching roles.
+        Returns tier name or None if no mapping matches.
+
+        Resolution order:
+        1. Exact role name match → mapped tier
+        2. Wildcard role "*" → mapped tier
+        3. No match → None (fall through to standard resolution)
+        """
+        if self._config is None or not self._config.platform_role_mapping:
+            return None
+
+        user_roles = getattr(source, "user_roles", None)
+        if not user_roles:
+            return None
+
+        platform = getattr(source, "platform", None)
+        if not platform:
+            return None
+        platform_name = platform.value
+
+        # Get platform-specific mapping
+        platform_mapping = self._config.platform_role_mapping.get(platform_name, {})
+        if not platform_mapping:
+            # Also try generic "default" mapping
+            platform_mapping = self._config.platform_role_mapping.get("default", {})
+        if not platform_mapping:
+            return None
+
+        # roles config is: {"administrator": "admin", "moderator": "user", ...}
+        for role in user_roles:
+            tier_name = platform_mapping.get(role)
+            if tier_name:
+                # Validate tier exists
+                if tier_name in self._config.tiers:
+                    return tier_name
+                logger.warning(
+                    "Platform role mapping: role '%s' → tier '%s' "
+                    "not defined, skipping",
+                    role,
+                    tier_name,
+                )
+
+        # Check wildcard
+        wildcard_tier = platform_mapping.get("*")
+        if wildcard_tier and wildcard_tier in self._config.tiers:
+            return wildcard_tier
+
+        return None
+
+    def is_elevated_tier(self, tier_name: str) -> bool:
+        """Check if a tier has elevated (MCP) access.
+
+        Elevated means the tier has wildcard tools, @mcp group,
+        or explicit mcp: patterns in resolved_tools.
+        """
+        tier_cfg = self.get_tier_config(tier_name)
+        if tier_cfg is None:
+            return True  # No config = unrestricted = elevated
+
+        # Check resolved_tools for wildcard or MCP patterns
+        if tier_cfg.resolved_tools is not None:
+            if "*" in tier_cfg.resolved_tools:
+                return True
+            if any(t.startswith("mcp:") for t in tier_cfg.resolved_tools):
+                return True
+
+        # Check allowed_tools (pre-expansion) for @mcp or mcp: patterns
+        if tier_cfg.allowed_tools:
+            for tool in tier_cfg.allowed_tools:
+                if tool in ("@mcp", "@all"):
+                    return True
+                if tool.startswith("mcp:"):
+                    return True
+
+        # Check allowed_toolsets for @mcp
+        if tier_cfg.allowed_toolsets:
+            for ts in tier_cfg.allowed_toolsets:
+                if ts in ("@mcp", "*"):
+                    return True
+
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Promote request store (T7d)
+# ---------------------------------------------------------------------------
+
+
+class PromoteRequestStore:
+    """SQLite-backed store for pending tier promotion requests.
+
+    Users request tier promotion via ``/promote <tier>``. Requests are stored
+    here for admin review. Admins can approve or deny via ``/promote approve/deny``.
+
+    Follows the same patterns as RuntimeUserStore: per-call connections,
+    threading lock, composite keys, WAL mode.
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            from hermes_constants import get_hermes_home
+
+            db_path = str(get_hermes_home() / "promote_requests.db")
+        self._db_path = db_path
+        self._lock = threading.RLock()  # Reentrant lock for nested calls
+        self._create_tables()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _create_tables(self) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS promote_requests (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        platform TEXT NOT NULL,
+                        requested_tier TEXT NOT NULL,
+                        current_tier TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at REAL NOT NULL,
+                        resolved_at REAL,
+                        resolved_by TEXT,
+                        reason TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_promote_status
+                    ON promote_requests(status, created_at)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_promote_user
+                    ON promote_requests(platform, user_id)
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+
+    def create_request(
+        self,
+        user_id: str,
+        platform: str,
+        requested_tier: str,
+        current_tier: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new promotion request. Returns the request dict or None if one already exists."""
+        import uuid
+
+        request_id = uuid.uuid4().hex[:8]  # Short UUID for easy reference
+        now = time.time()
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                # Check for existing pending request from same user
+                existing = conn.execute(
+                    "SELECT id FROM promote_requests "
+                    "WHERE user_id = ? AND platform = ? AND status = 'pending'",
+                    (user_id, platform),
+                ).fetchone()
+                if existing:
+                    return None  # Already has a pending request
+
+                conn.execute(
+                    "INSERT INTO promote_requests "
+                    "(id, user_id, platform, requested_tier, current_tier, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (request_id, user_id, platform, requested_tier, current_tier, now),
+                )
+                conn.commit()
+                return {
+                    "id": request_id,
+                    "user_id": user_id,
+                    "platform": platform,
+                    "requested_tier": requested_tier,
+                    "current_tier": current_tier,
+                    "status": "pending",
+                    "created_at": now,
+                }
+            finally:
+                conn.close()
+
+    def get_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get a request by ID."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT id, user_id, platform, requested_tier, current_tier, "
+                    "status, created_at, resolved_at, resolved_by, reason "
+                    "FROM promote_requests WHERE id = ?",
+                    (request_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                return {
+                    "id": row[0],
+                    "user_id": row[1],
+                    "platform": row[2],
+                    "requested_tier": row[3],
+                    "current_tier": row[4],
+                    "status": row[5],
+                    "created_at": row[6],
+                    "resolved_at": row[7],
+                    "resolved_by": row[8],
+                    "reason": row[9],
+                }
+            finally:
+                conn.close()
+
+    def list_pending(self) -> List[Dict[str, Any]]:
+        """List all pending requests."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT id, user_id, platform, requested_tier, current_tier, "
+                    "status, created_at, resolved_at, resolved_by, reason "
+                    "FROM promote_requests WHERE status = 'pending' "
+                    "ORDER BY created_at DESC"
+                ).fetchall()
+                return [
+                    {
+                        "id": r[0],
+                        "user_id": r[1],
+                        "platform": r[2],
+                        "requested_tier": r[3],
+                        "current_tier": r[4],
+                        "status": r[5],
+                        "created_at": r[6],
+                        "resolved_at": r[7],
+                        "resolved_by": r[8],
+                        "reason": r[9],
+                    }
+                    for r in rows
+                ]
+            finally:
+                conn.close()
+
+    def approve_request(
+        self,
+        request_id: str,
+        resolved_by: str,
+        reason: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Approve a pending request. Returns the updated request or None."""
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM promote_requests WHERE id = ?",
+                    (request_id,),
+                ).fetchone()
+                if not row or row[0] != "pending":
+                    return None
+                conn.execute(
+                    "UPDATE promote_requests SET status = 'approved', "
+                    "resolved_at = ?, resolved_by = ?, reason = ? WHERE id = ?",
+                    (now, resolved_by, reason, request_id),
+                )
+                conn.commit()
+                return self.get_request(request_id)
+            finally:
+                conn.close()
+
+    def deny_request(
+        self,
+        request_id: str,
+        resolved_by: str,
+        reason: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Deny a pending request. Returns the updated request or None."""
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM promote_requests WHERE id = ?",
+                    (request_id,),
+                ).fetchone()
+                if not row or row[0] != "pending":
+                    return None
+                conn.execute(
+                    "UPDATE promote_requests SET status = 'denied', "
+                    "resolved_at = ?, resolved_by = ?, reason = ? WHERE id = ?",
+                    (now, resolved_by, reason, request_id),
+                )
+                conn.commit()
+                return self.get_request(request_id)
+            finally:
+                conn.close()
+
+    def cleanup_expired(self, max_age_hours: int = 72) -> int:
+        """Remove expired pending requests older than max_age_hours.
+
+        Returns the number of removed requests.
+        """
+        cutoff = time.time() - (max_age_hours * 3600)
+        with self._lock:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(
+                    "DELETE FROM promote_requests "
+                    "WHERE status = 'pending' AND created_at < ?",
+                    (cutoff,),
+                )
+                conn.commit()
+                return cursor.rowcount
+            finally:
+                conn.close()

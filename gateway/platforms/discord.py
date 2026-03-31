@@ -30,6 +30,7 @@ try:
     import discord
     from discord import Message as DiscordMessage, Intents
     from discord.ext import commands
+
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
@@ -40,6 +41,7 @@ except ImportError:
 
 import sys
 from pathlib import Path as _Path
+
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
@@ -88,10 +90,10 @@ class VoiceReceiver:
     completed utterances via a callback.
     """
 
-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
+    SILENCE_THRESHOLD = 1.5  # seconds of silence → end of utterance
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
-    SAMPLE_RATE = 48000        # Discord native rate
-    CHANNELS = 2               # Discord sends stereo
+    SAMPLE_RATE = 48000  # Discord native rate
+    CHANNELS = 2  # Discord sends stereo
 
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
@@ -191,7 +193,8 @@ class VoiceReceiver:
         # Set on the current live websocket (for immediate effect)
         try:
             from discord.utils import MISSING
-            if hasattr(conn, 'ws') and conn.ws is not MISSING:
+
+            if hasattr(conn, "ws") and conn.ws is not MISSING:
                 conn.ws._hook = wrapped_hook
                 logger.info("Speaking hook installed on live websocket")
         except Exception as e:
@@ -210,7 +213,8 @@ class VoiceReceiver:
         if self._packet_debug_count <= 5:
             logger.debug(
                 "Raw UDP packet: len=%d, first_bytes=%s",
-                len(data), data[:4].hex() if len(data) >= 4 else "short",
+                len(data),
+                data[:4].hex() if len(data) >= 4 else "short",
             )
 
         if len(data) < 16:
@@ -221,7 +225,9 @@ class VoiceReceiver:
         # Payload type (byte 1 lower 7 bits) = 0x78 (120) for voice.
         if (data[0] >> 6) != 2 or (data[1] & 0x7F) != 0x78:
             if self._packet_debug_count <= 5:
-                logger.debug("Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1])
+                logger.debug(
+                    "Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1]
+                )
             return
 
         first_byte = data[0]
@@ -251,7 +257,11 @@ class VoiceReceiver:
                 known_user = self._ssrc_to_user.get(ssrc, "unknown")
             logger.debug(
                 "RTP packet: ssrc=%d, seq=%d, user=%s, hdr=%d, ext_data=%d",
-                ssrc, seq, known_user, header_size, ext_data_len,
+                ssrc,
+                seq,
+                known_user,
+                header_size,
+                ext_data_len,
             )
 
         header = bytes(data[:header_size])
@@ -266,11 +276,17 @@ class VoiceReceiver:
 
         try:
             import nacl.secret  # noqa: delayed import – only in voice path
+
             box = nacl.secret.Aead(self._secret_key)
             decrypted = box.decrypt(encrypted, header, bytes(nonce))
         except Exception as e:
             if self._packet_debug_count <= 10:
-                logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
+                logger.warning(
+                    "NaCl decrypt failed: %s (hdr=%d, enc=%d)",
+                    e,
+                    header_size,
+                    len(encrypted),
+                )
             return
 
         # Skip encrypted extension data to get the actual opus payload
@@ -284,6 +300,7 @@ class VoiceReceiver:
             if user_id:
                 try:
                     import davey
+
                     decrypted = self._dave_session.decrypt(
                         user_id, davey.MediaType.audio, decrypted
                     )
@@ -291,7 +308,9 @@ class VoiceReceiver:
                     # Unencrypted passthrough — use NaCl-decrypted data as-is
                     if "Unencrypted" not in str(e):
                         if self._packet_debug_count <= 10:
-                            logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+                            logger.warning(
+                                "DAVE decrypt failed for ssrc=%d: %s", ssrc, e
+                            )
                         return
             # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
             # Opus decode directly — audio may be in passthrough mode.
@@ -327,13 +346,16 @@ class VoiceReceiver:
             bot_id = self._vc.user.id if self._vc.user else 0
             allowed = self._allowed_user_ids
             candidates = [
-                m.id for m in channel.members
+                m.id
+                for m in channel.members
                 if m.id != bot_id and (not allowed or str(m.id) in allowed)
             ]
             if len(candidates) == 1:
                 uid = candidates[0]
                 self._ssrc_to_user[ssrc] = uid
-                logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
+                logger.info(
+                    "Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid
+                )
                 return uid
         except Exception:
             pass
@@ -355,7 +377,10 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                if (
+                    silence_duration >= self.SILENCE_THRESHOLD
+                    and buf_duration >= self.MIN_SPEECH_DURATION
+                ):
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
@@ -377,8 +402,9 @@ class VoiceReceiver:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def pcm_to_wav(pcm_data: bytes, output_path: str,
-                   src_rate: int = 48000, src_channels: int = 2):
+    def pcm_to_wav(
+        pcm_data: bytes, output_path: str, src_rate: int = 48000, src_channels: int = 2
+    ):
         """Convert raw PCM to 16kHz mono WAV via ffmpeg."""
         with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as f:
             f.write(pcm_data)
@@ -386,13 +412,22 @@ class VoiceReceiver:
         try:
             subprocess.run(
                 [
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-f", "s16le",
-                    "-ar", str(src_rate),
-                    "-ac", str(src_channels),
-                    "-i", pcm_path,
-                    "-ar", "16000",
-                    "-ac", "1",
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    str(src_rate),
+                    "-ac",
+                    str(src_channels),
+                    "-i",
+                    pcm_path,
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
                     output_path,
                 ],
                 check=True,
@@ -433,10 +468,16 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
-        self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
+        self._voice_timeout_tasks: Dict[
+            int, asyncio.Task
+        ] = {}  # guild_id -> timeout task
         # Phase 2: voice listening
-        self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
-        self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
+        self._voice_receivers: Dict[
+            int, VoiceReceiver
+        ] = {}  # guild_id -> VoiceReceiver
+        self._voice_listen_tasks: Dict[
+            int, asyncio.Task
+        ] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Track threads where the bot has participated so follow-up messages
@@ -453,20 +494,24 @@ class DiscordAdapter(BasePlatformAdapter):
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
-            logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
+            logger.error(
+                "[%s] discord.py not installed. Run: pip install discord.py", self.name
+            )
             return False
 
         # Load opus codec for voice channel support
         if not discord.opus.is_loaded():
             import ctypes.util
+
             opus_path = ctypes.util.find_library("opus")
             # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
             # so fall back to known Homebrew paths if needed.
             if not opus_path:
                 import sys
+
                 _homebrew_paths = (
                     "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
-                    "/usr/local/lib/libopus.dylib",     # Intel Mac
+                    "/usr/local/lib/libopus.dylib",  # Intel Mac
                 )
                 if sys.platform == "darwin":
                     for _hp in _homebrew_paths:
@@ -477,7 +522,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 try:
                     discord.opus.load_opus(opus_path)
                 except Exception:
-                    logger.warning("Opus codec found at %s but failed to load", opus_path)
+                    logger.warning(
+                        "Opus codec found at %s but failed to load", opus_path
+                    )
             if not discord.opus.is_loaded():
                 logger.warning("Opus codec not found — voice channel playback disabled")
 
@@ -488,13 +535,22 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             # Acquire scoped lock to prevent duplicate bot token usage
             from gateway.status import acquire_scoped_lock
+
             self._token_lock_identity = self.config.token
-            acquired, existing = acquire_scoped_lock('discord-bot-token', self._token_lock_identity, metadata={'platform': 'discord'})
+            acquired, existing = acquire_scoped_lock(
+                "discord-bot-token",
+                self._token_lock_identity,
+                metadata={"platform": "discord"},
+            )
             if not acquired:
-                owner_pid = existing.get('pid') if isinstance(existing, dict) else None
-                message = f'Discord bot token already in use' + (f' (PID {owner_pid})' if owner_pid else '') + '. Stop the other gateway first.'
-                logger.error('[%s] %s', self.name, message)
-                self._set_fatal_error('discord_token_lock', message, retryable=False)
+                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+                message = (
+                    f"Discord bot token already in use"
+                    + (f" (PID {owner_pid})" if owner_pid else "")
+                    + ". Stop the other gateway first."
+                )
+                logger.error("[%s] %s", self.name, message)
+                self._set_fatal_error("discord_token_lock", message, retryable=False)
                 return False
 
             # Set up intents -- members intent needed for username-to-ID resolution
@@ -515,7 +571,8 @@ class DiscordAdapter(BasePlatformAdapter):
             allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
             if allowed_env:
                 self._allowed_user_ids = {
-                    _clean_discord_id(uid) for uid in allowed_env.split(",")
+                    _clean_discord_id(uid)
+                    for uid in allowed_env.split(",")
                     if uid.strip()
                 }
 
@@ -524,7 +581,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # Register event handlers
             @self._client.event
             async def on_ready():
-                logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+                logger.info(
+                    "[%s] Connected as %s", adapter_self.name, adapter_self._client.user
+                )
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -532,9 +591,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Sync slash commands with Discord
                 try:
                     synced = await adapter_self._client.tree.sync()
-                    logger.info("[%s] Synced %d slash command(s)", adapter_self.name, len(synced))
+                    logger.info(
+                        "[%s] Synced %d slash command(s)",
+                        adapter_self.name,
+                        len(synced),
+                    )
                 except Exception as e:  # pragma: no cover - defensive logging
-                    logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
+                    logger.warning(
+                        "[%s] Slash command sync failed: %s",
+                        adapter_self.name,
+                        e,
+                        exc_info=True,
+                    )
                 adapter_self._ready_event.set()
 
             @self._client.event
@@ -545,7 +613,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
-                if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                if message.type not in (
+                    discord.MessageType.default,
+                    discord.MessageType.reply,
+                ):
                     return
 
                 # Check if the message author is in the allowed user list
@@ -561,7 +632,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     if allow_bots == "none":
                         return
                     elif allow_bots == "mentions":
-                        if not self._client.user or self._client.user not in message.mentions:
+                        if (
+                            not self._client.user
+                            or self._client.user not in message.mentions
+                        ):
                             return
                     # "all" falls through to handle_message
 
@@ -573,7 +647,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 _ignore_no_mention = os.getenv(
                     "DISCORD_IGNORE_NO_MENTION", "true"
                 ).lower() in ("true", "1", "yes")
-                if _ignore_no_mention and message.mentions and not isinstance(message.channel, discord.DMChannel):
+                if (
+                    _ignore_no_mention
+                    and message.mentions
+                    and not isinstance(message.channel, discord.DMChannel)
+                ):
                     _bot_mentioned = (
                         self._client.user is not None
                         and self._client.user in message.mentions
@@ -610,8 +688,10 @@ class DiscordAdapter(BasePlatformAdapter):
                         "Voice state: %s (%d) %s (guild %d)",
                         member.display_name,
                         member.id,
-                        "joined " + after.channel.name if joined
-                        else "left " + before.channel.name if left
+                        "joined " + after.channel.name
+                        if joined
+                        else "left " + before.channel.name
+                        if left
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
@@ -629,10 +709,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
 
         except asyncio.TimeoutError:
-            logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            logger.error(
+                "[%s] Timeout waiting for connection to Discord",
+                self.name,
+                exc_info=True,
+            )
             return False
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True
+            )
             return False
 
     async def disconnect(self) -> None:
@@ -642,13 +728,17 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
-                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+                logger.debug(
+                    "[%s] Error leaving voice channel %s: %s", self.name, guild_id, e
+                )
 
         if self._client:
             try:
                 await self._client.close()
             except Exception as e:  # pragma: no cover - defensive logging
-                logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
+                logger.warning(
+                    "[%s] Error during disconnect: %s", self.name, e, exc_info=True
+                )
 
         self._running = False
         self._client = None
@@ -657,8 +747,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Release the token lock
         try:
             from gateway.status import release_scoped_lock
-            if getattr(self, '_token_lock_identity', None):
-                release_scoped_lock('discord-bot-token', self._token_lock_identity)
+
+            if getattr(self, "_token_lock_identity", None):
+                release_scoped_lock("discord-bot-token", self._token_lock_identity)
                 self._token_lock_identity = None
         except Exception:
             pass
@@ -678,7 +769,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _remove_reaction(self, message: Any, emoji: str) -> bool:
         """Remove the bot's own emoji reaction from a Discord message."""
-        if not message or not hasattr(message, "remove_reaction") or not self._client or not self._client.user:
+        if (
+            not message
+            or not hasattr(message, "remove_reaction")
+            or not self._client
+            or not self._client.user
+        ):
             return False
         try:
             await message.remove_reaction(emoji, self._client.user)
@@ -689,7 +785,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in ("false", "0", "no")
+        return os.getenv("DISCORD_REACTIONS", "true").lower() not in (
+            "false",
+            "0",
+            "no",
+        )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction for normal Discord message events."""
@@ -713,7 +813,7 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a message to a Discord channel."""
         if not self._client:
@@ -772,11 +872,13 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={"message_ids": message_ids},
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to send Discord message: %s", self.name, e, exc_info=True
+            )
             return SendResult(success=False, error=str(e))
 
     async def edit_message(
@@ -795,11 +897,17 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.fetch_message(int(message_id))
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
-                formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
+                formatted = formatted[: self.MAX_MESSAGE_LENGTH - 3] + "..."
             await msg.edit(content=formatted)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to edit Discord message %s: %s",
+                self.name,
+                message_id,
+                e,
+                exc_info=True,
+            )
             return SendResult(success=False, error=str(e))
 
     async def _send_file_attachment(
@@ -838,7 +946,9 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
-                logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
+                logger.info(
+                    "[%s] Playing TTS in voice channel (guild=%d)", self.name, gid
+                )
                 success = await self.play_in_voice_channel(gid, audio_path)
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
@@ -863,7 +973,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
 
             if not os.path.exists(audio_path):
-                return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+                return SendResult(
+                    success=False, error=f"Audio file not found: {audio_path}"
+                )
 
             filename = os.path.basename(audio_path)
 
@@ -877,6 +989,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 duration_secs = 5.0
                 try:
                     from mutagen.oggopus import OggOpus
+
                     info = OggOpus(audio_path)
                     duration_secs = info.info.length
                 except Exception:
@@ -886,15 +999,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 waveform_b64 = base64.b64encode(waveform_bytes).decode()
 
                 import json as _json
-                payload = _json.dumps({
-                    "flags": 8192,
-                    "attachments": [{
-                        "id": "0",
-                        "filename": "voice-message.ogg",
-                        "duration_secs": round(duration_secs, 2),
-                        "waveform": waveform_b64,
-                    }],
-                })
+
+                payload = _json.dumps(
+                    {
+                        "flags": 8192,
+                        "attachments": [
+                            {
+                                "id": "0",
+                                "filename": "voice-message.ogg",
+                                "duration_secs": round(duration_secs, 2),
+                                "waveform": waveform_b64,
+                            }
+                        ],
+                    }
+                )
                 form = [
                     {"name": "payload_json", "value": payload},
                     {
@@ -905,18 +1023,29 @@ class DiscordAdapter(BasePlatformAdapter):
                     },
                 ]
                 msg_data = await self._client.http.request(
-                    discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
+                    discord.http.Route(
+                        "POST", "/channels/{channel_id}/messages", channel_id=channel.id
+                    ),
                     form=form,
                 )
                 return SendResult(success=True, message_id=str(msg_data["id"]))
             except Exception as voice_err:
-                logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
+                logger.debug(
+                    "Voice message flag failed, falling back to file: %s", voice_err
+                )
                 file = discord.File(io.BytesIO(file_data), filename=filename)
                 msg = await channel.send(file=file)
                 return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+            logger.error(
+                "[%s] Failed to send audio, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return await super().send_voice(
+                chat_id, audio_path, caption, reply_to, metadata=metadata
+            )
 
     # ------------------------------------------------------------------
     # Voice channel methods (join / leave / play)
@@ -1011,7 +1140,9 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
             except asyncio.TimeoutError:
-                logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                logger.warning(
+                    "Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT
+                )
                 vc.stop()
             self._reset_voice_timeout(guild_id)
             return True
@@ -1088,17 +1219,20 @@ class DiscordAdapter(BasePlatformAdapter):
         for m in channel.members:
             if bot_user and m.id == bot_user.id:
                 continue  # skip the bot itself
-            members_info.append({
-                "user_id": m.id,
-                "display_name": m.display_name,
-                "is_bot": m.bot,
-            })
+            members_info.append(
+                {
+                    "user_id": m.id,
+                    "display_name": m.display_name,
+                    "is_bot": m.bot,
+                }
+            )
 
         # Currently speaking users (from SSRC mapping + active buffers)
         speaking_user_ids: set = set()
         receiver = self._voice_receivers.get(guild_id)
         if receiver:
             import time as _time
+
             now = _time.monotonic()
             with receiver._lock:
                 for ssrc, last_t in receiver._last_packet_time.items():
@@ -1129,7 +1263,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not info:
             return ""
 
-        parts = [f"[Voice channel: #{info['channel_name']} — {info['member_count']} participant(s)]"]
+        parts = [
+            f"[Voice channel: #{info['channel_name']} — {info['member_count']} participant(s)]"
+        ]
         for m in info["members"]:
             status = " (speaking)" if m["is_speaking"] else ""
             parts.append(f"  - {m['display_name']}{status}")
@@ -1162,7 +1298,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     try:
                         vc = self._voice_clients.get(guild_id)
                         if vc and vc.is_connected():
-                            vc._connection.send_packet(b'\xf8\xff\xfe')
+                            vc._connection.send_packet(b"\xf8\xff\xfe")
                     except Exception:
                         pass
 
@@ -1180,15 +1316,23 @@ class DiscordAdapter(BasePlatformAdapter):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode import is_whisper_hallucination
 
-        tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
+        tmp_f = tempfile.NamedTemporaryFile(
+            suffix=".wav", prefix="vc_listen_", delete=False
+        )
         wav_path = tmp_f.name
         tmp_f.close()
         try:
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
 
-            from tools.transcription_tools import transcribe_audio, get_stt_model_from_config
+            from tools.transcription_tools import (
+                transcribe_audio,
+                get_stt_model_from_config,
+            )
+
             stt_model = get_stt_model_from_config()
-            result = await asyncio.to_thread(transcribe_audio, wav_path, model=stt_model)
+            result = await asyncio.to_thread(
+                transcribe_audio, wav_path, model=stt_model
+            )
 
             if not result.get("success"):
                 return
@@ -1230,10 +1374,19 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             return await self._send_file_attachment(chat_id, image_path, caption)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Image file not found: {image_path}")
+            return SendResult(
+                success=False, error=f"Image file not found: {image_path}"
+            )
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send local image, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
+            logger.error(
+                "[%s] Failed to send local image, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return await super().send_image_file(
+                chat_id, image_path, caption, reply_to, metadata=metadata
+            )
 
     async def send_image(
         self,
@@ -1259,7 +1412,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
             async with aiohttp.ClientSession() as session:
-                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                async with session.get(
+                    image_url, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
                     if resp.status != 200:
                         raise Exception(f"Failed to download image: HTTP {resp.status}")
 
@@ -1276,6 +1431,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         ext = "webp"
 
                     import io
+
                     file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
 
                     msg = await channel.send(
@@ -1312,10 +1468,19 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             return await self._send_file_attachment(chat_id, video_path, caption)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Video file not found: {video_path}")
+            return SendResult(
+                success=False, error=f"Video file not found: {video_path}"
+            )
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send local video, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_video(chat_id, video_path, caption, reply_to, metadata=metadata)
+            logger.error(
+                "[%s] Failed to send local video, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return await super().send_video(
+                chat_id, video_path, caption, reply_to, metadata=metadata
+            )
 
     async def send_document(
         self,
@@ -1328,12 +1493,21 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(
+                chat_id, file_path, caption, file_name=file_name
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+            logger.error(
+                "[%s] Failed to send document, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return await super().send_document(
+                chat_id, file_path, caption, file_name, reply_to, metadata=metadata
+            )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing indicator for a channel.
@@ -1354,14 +1528,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 while True:
                     try:
                         route = discord.http.Route(
-                            "POST", "/channels/{channel_id}/typing",
+                            "POST",
+                            "/channels/{channel_id}/typing",
                             channel_id=chat_id,
                         )
                         await self._client.http.request(route)
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
+                        logger.debug(
+                            "Discord typing indicator failed for %s: %s", chat_id, e
+                        )
                         return
                     await asyncio.sleep(8)
             except asyncio.CancelledError:
@@ -1411,11 +1588,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return {
                 "name": name,
                 "type": chat_type,
-                "guild_id": str(channel.guild.id) if hasattr(channel, "guild") and channel.guild else None,
-                "guild_name": channel.guild.name if hasattr(channel, "guild") and channel.guild else None,
+                "guild_id": str(channel.guild.id)
+                if hasattr(channel, "guild") and channel.guild
+                else None,
+                "guild_name": channel.guild.name
+                if hasattr(channel, "guild") and channel.guild
+                else None,
             }
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to get chat info for %s: %s",
+                self.name,
+                chat_id,
+                e,
+                exc_info=True,
+            )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
     async def _resolve_allowed_usernames(self) -> None:
@@ -1441,7 +1628,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not to_resolve:
             return
 
-        print(f"[{self.name}] Resolving {len(to_resolve)} username(s): {', '.join(to_resolve)}")
+        print(
+            f"[{self.name}] Resolving {len(to_resolve)} username(s): {', '.join(to_resolve)}"
+        )
         resolved_count = 0
 
         for guild in self._client.guilds:
@@ -1451,7 +1640,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 if len(members) < guild.member_count:
                     members = [m async for m in guild.fetch_members(limit=None)]
             except Exception as e:
-                logger.warning("Failed to fetch members for guild %s: %s", guild.name, e)
+                logger.warning(
+                    "Failed to fetch members for guild %s: %s", guild.name, e
+                )
                 continue
 
             for member in members:
@@ -1459,16 +1650,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 display_lower = member.display_name.lower()
                 global_lower = (member.global_name or "").lower()
 
-                matched = name_lower in to_resolve or display_lower in to_resolve or global_lower in to_resolve
+                matched = (
+                    name_lower in to_resolve
+                    or display_lower in to_resolve
+                    or global_lower in to_resolve
+                )
                 if matched:
                     uid = str(member.id)
                     numeric_ids.add(uid)
                     resolved_count += 1
-                    matched_name = name_lower if name_lower in to_resolve else (
-                        display_lower if display_lower in to_resolve else global_lower
+                    matched_name = (
+                        name_lower
+                        if name_lower in to_resolve
+                        else (
+                            display_lower
+                            if display_lower in to_resolve
+                            else global_lower
+                        )
                     )
                     to_resolve.discard(matched_name)
-                    print(f"[{self.name}] Resolved '{matched_name}' -> {uid} ({member.name}#{member.discriminator})")
+                    print(
+                        f"[{self.name}] Resolved '{matched_name}' -> {uid} ({member.name}#{member.discriminator})"
+                    )
 
             if not to_resolve:
                 break
@@ -1480,7 +1683,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._allowed_user_ids = numeric_ids
         os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
-            print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+            print(
+                f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)"
+            )
 
     def format_message(self, content: str) -> str:
         """
@@ -1524,24 +1729,32 @@ class DiscordAdapter(BasePlatformAdapter):
 
         @tree.command(name="new", description="Start a new conversation")
         async def slash_new(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/reset", "New conversation started~")
+            await self._run_simple_slash(
+                interaction, "/reset", "New conversation started~"
+            )
 
         @tree.command(name="reset", description="Reset your Hermes session")
         async def slash_reset(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/reset", "Session reset~")
 
         @tree.command(name="model", description="Show or change the model")
-        @discord.app_commands.describe(name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current.")
+        @discord.app_commands.describe(
+            name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current."
+        )
         async def slash_model(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/model {name}".strip())
 
         @tree.command(name="reasoning", description="Show or change reasoning effort")
-        @discord.app_commands.describe(effort="Reasoning effort: xhigh, high, medium, low, minimal, or none.")
+        @discord.app_commands.describe(
+            effort="Reasoning effort: xhigh, high, medium, low, minimal, or none."
+        )
         async def slash_reasoning(interaction: discord.Interaction, effort: str = ""):
             await self._run_simple_slash(interaction, f"/reasoning {effort}".strip())
 
         @tree.command(name="personality", description="Set a personality")
-        @discord.app_commands.describe(name="Personality name. Leave empty to list available.")
+        @discord.app_commands.describe(
+            name="Personality name. Leave empty to list available."
+        )
         async def slash_personality(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/personality {name}".strip())
 
@@ -1570,12 +1783,16 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/compress")
 
         @tree.command(name="title", description="Set or show the session title")
-        @discord.app_commands.describe(name="Session title. Leave empty to show current.")
+        @discord.app_commands.describe(
+            name="Session title. Leave empty to show current."
+        )
         async def slash_title(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/title {name}".strip())
 
         @tree.command(name="resume", description="Resume a previously-named session")
-        @discord.app_commands.describe(name="Session name to resume. Leave empty to list sessions.")
+        @discord.app_commands.describe(
+            name="Session name to resume. Leave empty to list sessions."
+        )
         async def slash_resume(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/resume {name}".strip())
 
@@ -1601,23 +1818,42 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/reload-mcp")
 
         @tree.command(name="voice", description="Toggle voice reply mode")
-        @discord.app_commands.describe(mode="Voice mode: on, off, tts, channel, leave, or status")
-        @discord.app_commands.choices(mode=[
-            discord.app_commands.Choice(name="channel — join your voice channel", value="channel"),
-            discord.app_commands.Choice(name="leave — leave voice channel", value="leave"),
-            discord.app_commands.Choice(name="on — voice reply to voice messages", value="on"),
-            discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
-            discord.app_commands.Choice(name="off — text only", value="off"),
-            discord.app_commands.Choice(name="status — show current mode", value="status"),
-        ])
+        @discord.app_commands.describe(
+            mode="Voice mode: on, off, tts, channel, leave, or status"
+        )
+        @discord.app_commands.choices(
+            mode=[
+                discord.app_commands.Choice(
+                    name="channel — join your voice channel", value="channel"
+                ),
+                discord.app_commands.Choice(
+                    name="leave — leave voice channel", value="leave"
+                ),
+                discord.app_commands.Choice(
+                    name="on — voice reply to voice messages", value="on"
+                ),
+                discord.app_commands.Choice(
+                    name="tts — voice reply to all messages", value="tts"
+                ),
+                discord.app_commands.Choice(name="off — text only", value="off"),
+                discord.app_commands.Choice(
+                    name="status — show current mode", value="status"
+                ),
+            ]
+        )
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
-        @tree.command(name="update", description="Update Hermes Agent to the latest version")
+        @tree.command(
+            name="update", description="Update Hermes Agent to the latest version"
+        )
         async def slash_update(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/update", "Update initiated~")
 
-        @tree.command(name="thread", description="Create a new thread and start a Hermes session in it")
+        @tree.command(
+            name="thread",
+            description="Create a new thread and start a Hermes session in it",
+        )
         @discord.app_commands.describe(
             name="Thread name",
             message="Optional first message to send to Hermes in the thread",
@@ -1630,9 +1866,13 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_archive_duration: int = 1440,
         ):
             await interaction.response.defer(ephemeral=True)
-            await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
+            await self._handle_thread_create_slash(
+                interaction, name, message, auto_archive_duration
+            )
 
-    def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
+    def _build_slash_event(
+        self, interaction: discord.Interaction, text: str
+    ) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
         is_dm = isinstance(interaction.channel, discord.DMChannel)
         is_thread = isinstance(interaction.channel, discord.Thread)
@@ -1655,6 +1895,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Get channel topic (if available)
         chat_topic = getattr(interaction.channel, "topic", None)
 
+        # T4: Extract Discord roles for platform role mapping
+        _discord_roles = None
+        if hasattr(interaction.user, "roles") and interaction.user.roles:
+            _discord_roles = [r.name for r in interaction.user.roles]
+
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -1663,6 +1908,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            user_roles=_discord_roles,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -1694,7 +1940,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not result.get("success"):
             error = result.get("error", "unknown error")
-            await interaction.followup.send(f"Failed to create thread: {error}", ephemeral=True)
+            await interaction.followup.send(
+                f"Failed to create thread: {error}", ephemeral=True
+            )
             return
 
         thread_id = result.get("thread_id")
@@ -1711,7 +1959,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # If a message was provided, kick off a new Hermes session in the thread
         starter = (message or "").strip()
         if starter and thread_id:
-            await self._dispatch_thread_session(interaction, thread_id, thread_name, starter)
+            await self._dispatch_thread_session(
+                interaction, thread_id, thread_name, starter
+            )
 
     async def _dispatch_thread_session(
         self,
@@ -1727,6 +1977,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
 
+        # T4: Extract Discord roles for platform role mapping
+        _discord_roles = None
+        if hasattr(interaction.user, "roles") and interaction.user.roles:
+            _discord_roles = [r.name for r in interaction.user.roles]
+
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -1734,6 +1989,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_id=str(interaction.user.id),
             user_name=interaction.user.display_name,
             thread_id=thread_id,
+            user_roles=_discord_roles,
         )
 
         event = MessageEvent(
@@ -1748,7 +2004,9 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
 
-    async def _resolve_interaction_channel(self, interaction: discord.Interaction) -> Optional[Any]:
+    async def _resolve_interaction_channel(
+        self, interaction: discord.Interaction
+    ) -> Optional[Any]:
         """Return the interaction channel, fetching it if the payload is partial."""
         channel = getattr(interaction, "channel", None)
         if channel is not None:
@@ -1785,20 +2043,29 @@ class DiscordAdapter(BasePlatformAdapter):
             return {"error": "Thread name is required."}
 
         if auto_archive_duration not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
-            allowed = ", ".join(str(v) for v in sorted(VALID_THREAD_AUTO_ARCHIVE_MINUTES))
+            allowed = ", ".join(
+                str(v) for v in sorted(VALID_THREAD_AUTO_ARCHIVE_MINUTES)
+            )
             return {"error": f"auto_archive_duration must be one of: {allowed}."}
 
         channel = await self._resolve_interaction_channel(interaction)
         if channel is None:
             return {"error": "Could not resolve the current Discord channel."}
         if isinstance(channel, discord.DMChannel):
-            return {"error": "Discord threads can only be created inside server text channels, not DMs."}
+            return {
+                "error": "Discord threads can only be created inside server text channels, not DMs."
+            }
 
         parent_channel = self._thread_parent_channel(channel)
         if parent_channel is None:
-            return {"error": "Could not determine a parent text channel for the new thread."}
+            return {
+                "error": "Could not determine a parent text channel for the new thread."
+            }
 
-        display_name = getattr(getattr(interaction, "user", None), "display_name", None) or "unknown user"
+        display_name = (
+            getattr(getattr(interaction, "user", None), "display_name", None)
+            or "unknown user"
+        )
         reason = f"Requested by {display_name} via /thread"
         starter_message = (message or "").strip()
 
@@ -1817,7 +2084,10 @@ class DiscordAdapter(BasePlatformAdapter):
             }
         except Exception as direct_error:
             try:
-                seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
+                seed_content = (
+                    starter_message
+                    or f"\U0001f9f5 Thread created by Hermes: **{name}**"
+                )
                 seed_msg = await parent_channel.send(seed_content)
                 thread = await seed_msg.create_thread(
                     name=name,
@@ -1841,7 +2111,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
-    async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
+    async def _auto_create_thread(self, message: "DiscordMessage") -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
         Returns the created thread object, or ``None`` on failure.
@@ -1853,7 +2123,9 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
 
         try:
-            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+            thread = await message.create_thread(
+                name=thread_name, auto_archive_duration=1440
+            )
             return thread
         except Exception as e:
             logger.warning("[%s] Auto-thread creation failed: %s", self.name, e)
@@ -1877,7 +2149,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Discord embed description limit is 4096; show full command up to that
             max_desc = 4088
-            cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
+            cmd_display = (
+                command if len(command) <= max_desc else command[: max_desc - 3] + "..."
+            )
             embed = discord.Embed(
                 title="Command Approval Required",
                 description=f"```\n{cmd_display}\n```",
@@ -1922,7 +2196,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _format_thread_chat_name(self, thread: Any) -> str:
         """Build a readable chat name for thread-like Discord channels, including forum context when available."""
-        thread_name = getattr(thread, "name", None) or str(getattr(thread, "id", "thread"))
+        thread_name = getattr(thread, "name", None) or str(
+            getattr(thread, "id", "thread")
+        )
         parent = getattr(thread, "parent", None)
         guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
         guild_name = getattr(guild, "name", None)
@@ -1944,6 +2220,7 @@ class DiscordAdapter(BasePlatformAdapter):
     def _thread_state_path() -> Path:
         """Path to the persisted thread participation set."""
         from hermes_cli.config import get_hermes_home
+
         return get_hermes_home() / "discord_threads.json"
 
     @classmethod
@@ -1966,7 +2243,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Trim to most recent entries if over cap
             thread_list = list(self._bot_participated_threads)
             if len(thread_list) > self._MAX_TRACKED_THREADS:
-                thread_list = thread_list[-self._MAX_TRACKED_THREADS:]
+                thread_list = thread_list[-self._MAX_TRACKED_THREADS :]
                 self._bot_participated_threads = set(thread_list)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(thread_list), encoding="utf-8")
@@ -1999,12 +2276,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not isinstance(message.channel, discord.DMChannel):
             free_channels_raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+            free_channels = {
+                ch.strip() for ch in free_channels_raw.split(",") if ch.strip()
+            }
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
+            require_mention = os.getenv(
+                "DISCORD_REQUIRE_MENTION", "true"
+            ).lower() not in ("false", "0", "no")
             is_free_channel = bool(channel_ids & free_channels)
 
             # Skip the mention check if the message is in a thread where
@@ -2016,15 +2297,23 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
 
             if self._client.user and self._client.user in message.mentions:
-                message.content = message.content.replace(f"<@{self._client.user.id}>", "").strip()
-                message.content = message.content.replace(f"<@!{self._client.user.id}>", "").strip()
+                message.content = message.content.replace(
+                    f"<@{self._client.user.id}>", ""
+                ).strip()
+                message.content = message.content.replace(
+                    f"<@!{self._client.user.id}>", ""
+                ).strip()
 
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
+            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in (
+                "true",
+                "1",
+                "yes",
+            )
             if auto_thread:
                 thread = await self._auto_create_thread(message)
                 if thread:
@@ -2075,6 +2364,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Get channel topic (if available - TextChannels have topics, DMs/threads don't)
         chat_topic = getattr(message.channel, "topic", None)
 
+        # T4: Extract Discord roles for platform role mapping
+        _discord_roles = None
+        if hasattr(message.author, "roles") and message.author.roles:
+            _discord_roles = [r.name for r in message.author.roles]
+
         # Build source
         source = self.build_source(
             chat_id=str(effective_channel.id),
@@ -2084,6 +2378,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=message.author.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            user_roles=_discord_roles,
         )
 
         # Build media URLs -- download image attachments to local cache so the
@@ -2104,7 +2399,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     media_types.append(content_type)
                     print(f"[Discord] Cached user image: {cached_path}", flush=True)
                 except Exception as e:
-                    print(f"[Discord] Failed to cache image attachment: {e}", flush=True)
+                    print(
+                        f"[Discord] Failed to cache image attachment: {e}", flush=True
+                    )
                     # Fall back to the CDN URL if caching fails
                     media_urls.append(att.url)
                     media_types.append(content_type)
@@ -2118,7 +2415,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     media_types.append(content_type)
                     print(f"[Discord] Cached user audio: {cached_path}", flush=True)
                 except Exception as e:
-                    print(f"[Discord] Failed to cache audio attachment: {e}", flush=True)
+                    print(
+                        f"[Discord] Failed to cache audio attachment: {e}", flush=True
+                    )
                     media_urls.append(att.url)
                     media_types.append(content_type)
             else:
@@ -2133,18 +2432,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 if ext not in SUPPORTED_DOCUMENT_TYPES:
                     logger.warning(
                         "[Discord] Unsupported document type '%s' (%s), skipping",
-                        ext or "unknown", content_type,
+                        ext or "unknown",
+                        content_type,
                     )
                 else:
                     MAX_DOC_BYTES = 20 * 1024 * 1024
                     if att.size and att.size > MAX_DOC_BYTES:
                         logger.warning(
                             "[Discord] Document too large (%s bytes), skipping: %s",
-                            att.size, att.filename,
+                            att.size,
+                            att.filename,
                         )
                     else:
                         try:
                             import aiohttp
+
                             async with aiohttp.ClientSession() as session:
                                 async with session.get(
                                     att.url,
@@ -2159,17 +2461,28 @@ class DiscordAdapter(BasePlatformAdapter):
                             doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
                             media_urls.append(cached_path)
                             media_types.append(doc_mime)
-                            logger.info("[Discord] Cached user document: %s", cached_path)
+                            logger.info(
+                                "[Discord] Cached user document: %s", cached_path
+                            )
                             # Inject text content for .txt/.md files (capped at 100 KB)
                             MAX_TEXT_INJECT_BYTES = 100 * 1024
-                            if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                            if (
+                                ext in (".md", ".txt")
+                                and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES
+                            ):
                                 try:
                                     text_content = raw_bytes.decode("utf-8")
                                     display_name = att.filename or f"document{ext}"
-                                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                                    injection = f"[Content of {display_name}]:\n{text_content}"
+                                    display_name = re.sub(
+                                        r"[^\w.\- ]", "_", display_name
+                                    )
+                                    injection = (
+                                        f"[Content of {display_name}]:\n{text_content}"
+                                    )
                                     if pending_text_injection:
-                                        pending_text_injection = f"{pending_text_injection}\n\n{injection}"
+                                        pending_text_injection = (
+                                            f"{pending_text_injection}\n\n{injection}"
+                                        )
                                     else:
                                         pending_text_injection = injection
                                 except UnicodeDecodeError:
@@ -2177,12 +2490,18 @@ class DiscordAdapter(BasePlatformAdapter):
                         except Exception as e:
                             logger.warning(
                                 "[Discord] Failed to cache document %s: %s",
-                                att.filename, e, exc_info=True,
+                                att.filename,
+                                e,
+                                exc_info=True,
                             )
 
         event_text = message.content
         if pending_text_injection:
-            event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
+            event_text = (
+                f"{pending_text_injection}\n\n{event_text}"
+                if event_text
+                else pending_text_injection
+            )
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text)
@@ -2197,7 +2516,9 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=str(message.id),
             media_urls=media_urls,
             media_types=media_types,
-            reply_to_message_id=str(message.reference.message_id) if message.reference else None,
+            reply_to_message_id=str(message.reference.message_id)
+            if message.reference
+            else None,
             timestamp=message.created_at,
         )
 
@@ -2254,7 +2575,9 @@ if DISCORD_AVAILABLE:
             self.resolved = True
 
             # Update the embed with the decision
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            embed = (
+                interaction.message.embeds[0] if interaction.message.embeds else None
+            )
             if embed:
                 embed.color = color
                 embed.set_footer(text=f"{action} by {interaction.user.display_name}")
@@ -2268,6 +2591,7 @@ if DISCORD_AVAILABLE:
             # Store the approval decision
             try:
                 from tools.approval import approve_permanent
+
                 if action == "allow_once":
                     pass  # One-time approval handled by gateway
                 elif action == "allow_always":

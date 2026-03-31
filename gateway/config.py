@@ -51,6 +51,7 @@ TOOL_GROUPS: Dict[str, List[str]] = {
     "@messaging": ["send_message"],
     "@planning": ["todo"],
     "@clarify": ["clarify"],
+    "@mcp": ["mcp:*:*"],  # All MCP tools (third-party server tools)
     "@honcho": ["honcho_context", "honcho_profile", "honcho_search", "honcho_conclude"],
     "@homeassistant": [
         "ha_list_entities",
@@ -133,6 +134,7 @@ BUILTIN_TIER_PRESETS: Dict[str, Dict[str, Any]] = {
             "@messaging",
             "@planning",
             "@clarify",
+            "@mcp",
             "@honcho",
             "@homeassistant",
             "mixture_of_agents",
@@ -155,7 +157,7 @@ BUILTIN_TIER_PRESETS: Dict[str, Dict[str, Any]] = {
         "allow_admin_commands": False,
     },
     "guest": {
-        "allowed_tools": ["@clarify"],
+        "allowed_tools": ["@safe"],
         "allow_exec": False,
         "allow_admin_commands": False,
         "requests_per_hour": 10,
@@ -589,6 +591,12 @@ class PermissionTiersConfig:
     env_default_tier: str = "admin"  # Tier for remaining entries in *_ALLOWED_USERS
     pairing_default_tier: str = "user"  # Tier for pairing-approved users
     env_open_tier: str = "guest"  # Tier for ALLOW_ALL_USERS (open access)
+    # Phase 3: Platform role mapping (Telegram group admins, Discord roles → tiers)
+    platform_role_mapping: Dict[str, Any] = field(default_factory=dict)
+    # Phase 3: Audit logging
+    audit: Optional[Dict[str, Any]] = None
+    # Phase 3: Usage tracking (persistent rate limiting)
+    usage_tracking: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -602,6 +610,12 @@ class PermissionTiersConfig:
             "pairing_default_tier": self.pairing_default_tier,
             "env_open_tier": self.env_open_tier,
         }
+        if self.platform_role_mapping:
+            result["platform_role_mapping"] = self.platform_role_mapping
+        if self.audit is not None:
+            result["audit"] = self.audit
+        if self.usage_tracking is not None:
+            result["usage_tracking"] = self.usage_tracking
         return result
 
     @classmethod
@@ -685,6 +699,9 @@ class PermissionTiersConfig:
             env_default_tier=env_default_tier,
             pairing_default_tier=pairing_default_tier,
             env_open_tier=env_open_tier,
+            platform_role_mapping=data.get("platform_role_mapping", {}),
+            audit=data.get("audit"),
+            usage_tracking=data.get("usage_tracking"),
         )
 
 
