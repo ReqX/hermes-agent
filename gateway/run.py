@@ -2248,6 +2248,26 @@ class GatewayRunner:
                     user_cfg=_msg_user_cfg,
                 )
 
+        # --- T2: Per-command allowlist (strictly additive gate) ---
+        # When allowed_commands is set on the tier, ONLY those commands are
+        # permitted. When None, the binary admin_only/owner_only gates above
+        # remain the sole restriction (backward compatible).
+        if _msg_tier_cfg is not None and _msg_tier_cfg.allowed_commands is not None:
+            if canonical not in _msg_tier_cfg.allowed_commands:
+                self._audit_log.log(
+                    event_type="command_denied",
+                    platform=source.platform.value if source.platform else None,
+                    user_id=source.user_id,
+                    tier_name=_msg_tier_name,
+                    details=f"command={canonical} (not in allowed_commands)",
+                )
+                return self._permissions.format_tier_message(
+                    _msg_tier_cfg,
+                    "command_denied",
+                    source,
+                    user_cfg=_msg_user_cfg,
+                )
+
         # Owner-only slash commands — restricted to the configured owner tier.
         _tiered_owner_commands = {
             cmd.name for cmd in COMMAND_REGISTRY if cmd.owner_only
@@ -4042,6 +4062,14 @@ class GatewayRunner:
         else:
             lines.append("**Rate limit:** Unlimited")
 
+        # T1: Per-user tool override display
+        user_override = info.get("user_tool_override")
+        if user_override is not None:
+            override_preview = ", ".join(user_override[:10])
+            if len(user_override) > 10:
+                override_preview += f", … ({len(user_override)} total)"
+            lines.append(f"**Tool override:** {override_preview}")
+
         return "\n".join(lines)
 
     async def _handle_users_command(self, event: MessageEvent) -> str:
@@ -4152,6 +4180,27 @@ class GatewayRunner:
             )
 
         subcmd = args[0].lower()
+
+        # --- H-1: Admin gate for list/approve/deny subcommands ---
+        # Non-admin users can only use /promote <tier> (request creation).
+        if subcmd in ("list", "approve", "deny"):
+            _promote_tier_cfg = self._permissions.get_tier_config(
+                self._permissions.resolve_user_tier(source)
+            )
+            if (
+                _promote_tier_cfg is not None
+                and not _promote_tier_cfg.allow_admin_commands
+            ):
+                self._audit_log.log(
+                    event_type="command_denied",
+                    platform=source.platform.value if source.platform else None,
+                    user_id=getattr(source, "user_id", None),
+                    tier_name=self._permissions.resolve_user_tier(source),
+                    details=f"command=promote/{subcmd}",
+                )
+                return self._permissions.format_tier_message(
+                    _promote_tier_cfg, "command_denied", source
+                )
 
         # --- /promote list (admin only) ---
         if subcmd == "list":
@@ -4277,7 +4326,7 @@ class GatewayRunner:
         args = event.get_command_args().strip().split()
 
         if not args or args[0].isdigit():
-            limit = int(args[0]) if args and args[0].isdigit() else 10
+            limit = min(int(args[0]), 100) if args and args[0].isdigit() else 10
             events = self._audit_log.query(limit=limit)
             if not events:
                 return "No audit events found."
@@ -4295,7 +4344,9 @@ class GatewayRunner:
 
         if subcmd == "user" and len(args) >= 2:
             target_user = args[1]
-            limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+            limit = (
+                min(int(args[2]), 100) if len(args) > 2 and args[2].isdigit() else 20
+            )
             events = self._audit_log.query(user_id=target_user, limit=limit)
             if not events:
                 return f"No audit events for user `{target_user}`."
@@ -4309,7 +4360,9 @@ class GatewayRunner:
 
         if subcmd == "type" and len(args) >= 2:
             event_type = args[1]
-            limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+            limit = (
+                min(int(args[2]), 100) if len(args) > 2 and args[2].isdigit() else 20
+            )
             events = self._audit_log.query(event_type=event_type, limit=limit)
             if not events:
                 return f"No audit events of type `{event_type}`."
@@ -6181,6 +6234,7 @@ class GatewayRunner:
         # --- Permission tier filtering (opt-in, via PermissionManager) ---
         _tier_name = self._permissions.resolve_user_tier(source)
         _tier_cfg = self._permissions.get_tier_config(_tier_name)
+        _user_cfg = self._permissions.resolve_user_cfg(source)
         _allowed_tool_names = None  # None = use toolset filtering (backward compat)
         if _tier_cfg is not None:
             # Tool-level filtering (allowed_tools + @group expansion)
@@ -6202,6 +6256,22 @@ class GatewayRunner:
                             _allowed,
                             _pre_filter,
                         )
+
+            # --- T1: Per-user tool override (intersect with tier tools) ---
+            # User override can only RESTRICT, never expand.
+            if _user_cfg is not None and _user_cfg.resolved_tools_override is not None:
+                _user_override = _user_cfg.resolved_tools_override
+                if _allowed_tool_names is not None:
+                    # Both tier and user have tool-level allowlists → intersect
+                    _allowed_tool_names = _allowed_tool_names & _user_override
+                elif "*" in (_tier_cfg.resolved_tools or set()) or "*" in (
+                    _tier_cfg.allowed_toolsets or []
+                ):
+                    # Tier is wildcard — user override becomes the ceiling
+                    _allowed_tool_names = _user_override
+                else:
+                    # Toolset-level filtering already applied — intersect with override
+                    _allowed_tool_names = _user_override
         # --- allow_exec=False: strip code-execution tools (defense-in-depth) ---
         # Built-in tiers exclude the terminal toolset, but custom tiers that
         # set allow_exec: false while including a broad toolset (e.g. "*") would
@@ -6242,7 +6312,8 @@ class GatewayRunner:
                         n for n in _all_names if not n.startswith("mcp:")
                     )
                 except Exception:
-                    pass  # Fail open here — MCP tools are still gated by schema
+                    # Fail closed: if we can't enumerate tools, deny everything
+                    _allowed_tool_names = frozenset()
 
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility.
@@ -7113,7 +7184,12 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60):
+def _start_cron_ticker(
+    stop_event: threading.Event,
+    adapters=None,
+    interval: int = 60,
+    permissions_manager=None,
+):
     """
     Background thread that ticks the cron scheduler at a regular interval.
 
@@ -7128,6 +7204,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
 
     IMAGE_CACHE_EVERY = 60  # ticks — once per hour at default 60s interval
     CHANNEL_DIR_EVERY = 5  # ticks — every 5 minutes
+    RATE_CLEANUP_EVERY = 10  # ticks — every 10 minutes
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -7164,6 +7241,13 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
                     )
             except Exception as e:
                 logger.debug("Document cache cleanup error: %s", e)
+
+        # L-3: Prune expired rate limit counters (every 10 minutes)
+        if tick_count % RATE_CLEANUP_EVERY == 0 and permissions_manager is not None:
+            try:
+                permissions_manager.cleanup_rate_counters()
+            except Exception as e:
+                logger.debug("Rate counter cleanup error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")
@@ -7328,7 +7412,10 @@ async def start_gateway(
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters},
+        kwargs={
+            "adapters": runner.adapters,
+            "permissions_manager": runner._permissions,
+        },
         daemon=True,
         name="cron-ticker",
     )
