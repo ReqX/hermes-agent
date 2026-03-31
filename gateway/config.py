@@ -460,6 +460,9 @@ class TierDefinition:
     )
     allow_exec: bool = True
     allow_admin_commands: bool = True
+    allowed_commands: Optional[FrozenSet[str]] = (
+        None  # Per-command allowlist; None = no restriction (use admin_only/owner_only gates)
+    )
     time_restrictions: Optional[TimeRestrictions] = None
     requests_per_hour: Optional[int] = None  # Rate limit: null = unlimited
     messages: Dict[str, Dict[str, str]] = field(default_factory=dict)
@@ -472,6 +475,8 @@ class TierDefinition:
         }
         if self.allowed_tools is not None:
             result["allowed_tools"] = self.allowed_tools
+        if self.allowed_commands is not None:
+            result["allowed_commands"] = sorted(self.allowed_commands)
         if self.time_restrictions is not None:
             result["time_restrictions"] = self.time_restrictions.to_dict()
         if self.requests_per_hour is not None:
@@ -538,6 +543,19 @@ class TierDefinition:
                     raw_rph,
                 )
 
+        # Per-command allowlist (T2): optional list of slash command names
+        raw_cmds = data.get("allowed_commands")
+        allowed_commands: Optional[FrozenSet[str]] = None
+        if raw_cmds is not None:
+            if isinstance(raw_cmds, list):
+                allowed_commands = frozenset(str(c).lower() for c in raw_cmds)
+            else:
+                logger.warning(
+                    "TierDefinition: allowed_commands must be a list, got %s; "
+                    "ignoring (no command restriction)",
+                    type(raw_cmds).__name__,
+                )
+
         return cls(
             allowed_toolsets=allowed_toolsets,
             allowed_tools=allowed_tools,
@@ -546,6 +564,7 @@ class TierDefinition:
             allow_admin_commands=_coerce_bool(
                 data.get("allow_admin_commands"), default=True
             ),
+            allowed_commands=allowed_commands,
             time_restrictions=TimeRestrictions.from_dict(tr) if tr else None,
             requests_per_hour=requests_per_hour,
             messages=data.get("messages", {}),
@@ -554,24 +573,49 @@ class TierDefinition:
 
 @dataclass
 class UserTierConfig:
-    """Maps a single user (by platform ID) to a tier and locale."""
+    """Maps a single user (by platform ID) to a tier and locale.
+
+    Per-user tool overrides are optional. When set, they further restrict
+    (intersect with) the tier's resolved tools — they never expand access.
+    """
 
     tier: Optional[str] = None
     locale: str = "en"
+    allowed_tools: Optional[List[str]] = None
+    resolved_tools_override: Optional[FrozenSet[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "tier": self.tier,
             "locale": self.locale,
         }
+        if self.allowed_tools is not None:
+            result["allowed_tools"] = self.allowed_tools
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "UserTierConfig":
         if not data:
             return cls()
+        # Per-user tool overrides with @group expansion
+        raw_tools = data.get("allowed_tools")
+        allowed_tools: Optional[List[str]] = None
+        resolved_tools_override: Optional[FrozenSet[str]] = None
+        if raw_tools is not None:
+            if isinstance(raw_tools, list):
+                allowed_tools = [str(t) for t in raw_tools]
+                resolved_tools_override = frozenset(_expand_tool_groups(allowed_tools))
+            else:
+                logger.warning(
+                    "UserTierConfig: allowed_tools must be a list, got %s; "
+                    "ignoring (no override applied)",
+                    type(raw_tools).__name__,
+                )
         return cls(
             tier=data.get("tier"),
             locale=data.get("locale", "en"),
+            allowed_tools=allowed_tools,
+            resolved_tools_override=resolved_tools_override,
         )
 
 

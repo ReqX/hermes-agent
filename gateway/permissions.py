@@ -795,12 +795,14 @@ class PermissionManager:
         """Return comprehensive identity info for a user.
 
         Returns dict with: user_id, tier_name, tier_source, tool_count,
-        allow_exec, allow_admin_commands, time_restrictions, platform.
+        allow_exec, allow_admin_commands, time_restrictions, platform,
+        user_tool_override (if per-user tools configured).
         """
         user_id = getattr(source, "user_id", None)
         platform = getattr(source, "platform", None)
         tier_name = self.resolve_user_tier(source)
         tier_cfg = self.get_tier_config(tier_name)
+        user_cfg = self.resolve_user_cfg(source)
 
         # Determine source of the tier assignment
         tier_source = "default"
@@ -834,7 +836,12 @@ class PermissionManager:
             else:
                 tool_count = len(tier_cfg.allowed_toolsets or [])
 
-        return {
+        # Per-user tool override info (T1)
+        user_tool_override = None
+        if user_cfg is not None and user_cfg.resolved_tools_override is not None:
+            user_tool_override = sorted(user_cfg.resolved_tools_override)
+
+        result = {
             "user_id": user_id,
             "user_name": getattr(source, "user_name", None),
             "platform": platform.value if platform else None,
@@ -853,6 +860,9 @@ class PermissionManager:
             "requests_per_hour": (tier_cfg.requests_per_hour if tier_cfg else None),
             "rate_limit_remaining": self.rate_limit_remaining(source),
         }
+        if user_tool_override is not None:
+            result["user_tool_override"] = user_tool_override
+        return result
 
     # ------------------------------------------------------------------
     # Rate limiting
