@@ -1013,7 +1013,7 @@ class TestFormatTierMessage:
         tier = runner._permissions.get_tier_config("restricted")
         source = _make_source(user_id="u1")
         msg = runner._permissions.format_tier_message(tier, "unknown_key", source)
-        assert msg == "Permission denied."
+        assert msg == "Access restricted. Use /whoami to check your permissions."
 
     def test_no_permission_tiers_uses_english_default(self):
         runner = _make_runner(permission_tiers=None)
@@ -1242,12 +1242,12 @@ class TestConfigBoundaryHardening:
 
     def test_f10_none_tier_wildcard_falls_to_default(self):
         """F-10: Wildcard user with no tier resolves to default_tier."""
-        pt = _make_permission_config(
+        _pt = _make_permission_config(
             default_tier="restricted",
             users={"*": UserTierConfig()},  # tier=None
         )
-        runner = _make_runner(permission_tiers=pt)
-        source = _make_source(user_id="anyone")
+        _runner = _make_runner(permission_tiers=_pt)
+        _source = _make_source(user_id="anyone")
 
 
 # ------------------------------------------------------------------
@@ -1674,7 +1674,11 @@ class TestBuiltinTierPresets:
             }
         )
         guest = pt.tiers["guest"]
-        assert guest.resolved_tools == frozenset({"clarify"})
+        # T7b: Guest preset uses @safe (web + read + media + skills + clarify)
+        assert "clarify" in guest.resolved_tools
+        assert "web_search" in guest.resolved_tools
+        assert "read_file" in guest.resolved_tools
+        assert "vision_analyze" in guest.resolved_tools
         assert guest.allow_exec is False
         assert guest.allow_admin_commands is False
 
@@ -2341,7 +2345,7 @@ class TestRateLimitCheck:
 
     @pytest.fixture
     def pm_with_limit(self, tmp_path):
-        from gateway.permissions import PermissionManager, RuntimeUserStore
+        from gateway.permissions import PermissionManager
 
         config = _make_permission_config(
             tiers={
@@ -2413,7 +2417,7 @@ class TestRateLimitCheck:
     def test_counters_per_user(self, pm_with_limit):
         """Each user has independent counters."""
         user1 = _make_source(user_id="limited_user")
-        user2 = _make_source(user_id="another_limited")
+        _user2 = _make_source(user_id="another_limited")
         # Map user2 to limited tier via runtime
         # Actually, user2 maps to admin (default). Use limited_user's slot.
         # user1 uses 3 requests
@@ -2479,8 +2483,6 @@ class TestRateLimitCleanup:
     """Tests for PermissionManager.cleanup_rate_counters."""
 
     def test_cleanup_removes_old_buckets(self):
-        import time
-
         from gateway.permissions import PermissionManager
 
         config = _make_permission_config(
@@ -2761,15 +2763,17 @@ class TestMCPDefaultPolicy:
 
     def test_builtin_admin_has_explicit_tools(self):
         """Admin preset explicitly lists tools, NOT using *.
-        MCP tools are NOT included by default.
+        MCP tools ARE included via @mcp (T7c: admin gets MCP access).
         """
         from gateway.config import BUILTIN_TIER_PRESETS
 
         admin_preset = BUILTIN_TIER_PRESETS["admin"]
         tier = TierDefinition.from_dict(admin_preset)
-        # Admin lists individual tools — no wildcard, no mcp: patterns
-        mcp_patterns = [t for t in tier.resolved_tools if "mcp" in t.lower()]
-        assert len(mcp_patterns) == 0
+        # Admin lists individual tools — no wildcard
+        assert "*" not in tier.resolved_tools
+        # T7c: Admin includes @mcp which expands to mcp:*:*
+        mcp_patterns = [t for t in tier.resolved_tools if t.startswith("mcp:")]
+        assert len(mcp_patterns) > 0
 
     def test_builtin_user_excludes_mcp(self):
         """User preset should NOT include MCP tools."""
@@ -3100,7 +3104,7 @@ class TestAutoTierPairing:
 
         cfg = _make_auto_tier_config()
         pairing = _make_mock_pairing_store(
-            approved=[{"platform": "telegram", "user_id": "111"}]
+            approved=[{"platform": "telegram", "user_id": "777"}]
         )
         with patch.dict("os.environ", {"TELEGRAM_ALLOWED_USERS": "111"}, clear=False):
             mgr = PermissionManager(cfg, pairing_store=pairing)
@@ -3169,7 +3173,7 @@ class TestAutoTierDynamicPairing:
         from gateway.permissions import PermissionManager
 
         cfg = _make_auto_tier_config()
-        pairing = _make_mock_pairing_store(
+        _pairing = _make_mock_pairing_store(
             approved=[{"platform": "telegram", "user_id": "777"}]
         )
         # No pairing users injected at init (already tested that init injection works).
@@ -4031,3 +4035,1331 @@ class TestOwnerOnlyCommands:
 
         pm = PermissionManager(None)
         assert pm.owner_tier_name == "owner"
+
+
+# ------------------------------------------------------------------
+# Phase 11: UsageStore and NullUsageStore tests
+# ------------------------------------------------------------------
+
+
+class TestUsageStore:
+    """Tests for UsageStore - SQLite-backed usage tracking."""
+
+    def test_check_and_increment_first_call_allowed(self, tmp_path):
+        """First call returns (True, 1)."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        allowed, count = store.check_and_increment("telegram", "u1", limit=10)
+        assert allowed is True
+        assert count == 1
+
+    def test_check_and_increment_within_limit(self, tmp_path):
+        """limit=3, call 3 times, all return True."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        for i in range(3):
+            allowed, count = store.check_and_increment("telegram", "u1", limit=3)
+            assert allowed is True, f"Call {i + 1} should be allowed"
+            assert count == i + 1
+
+    def test_check_and_increment_exceeds_limit(self, tmp_path):
+        """limit=2, call 3 times, 3rd returns False."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        assert store.check_and_increment("telegram", "u1", limit=2) == (True, 1)
+        assert store.check_and_increment("telegram", "u1", limit=2) == (True, 2)
+        assert store.check_and_increment("telegram", "u1", limit=2) == (False, 2)
+
+    def test_check_and_increment_different_users_separate(self, tmp_path):
+        """2 users with limit=1, both allowed."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        allowed1, count1 = store.check_and_increment("telegram", "u1", limit=1)
+        allowed2, count2 = store.check_and_increment("telegram", "u2", limit=1)
+        assert allowed1 is True
+        assert count1 == 1
+        assert allowed2 is True
+        assert count2 == 1
+
+    def test_check_and_increment_different_platforms_separate(self, tmp_path):
+        """Same user, different platforms, separate counts."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        assert store.check_and_increment("telegram", "u1", limit=1) == (True, 1)
+        # Different platform resets counter for same user
+        assert store.check_and_increment("discord", "u1", limit=1) == (True, 1)
+        # Telegram still at limit
+        assert store.check_and_increment("telegram", "u1", limit=1) == (False, 1)
+
+    def test_check_and_increment_returns_current_count(self, tmp_path):
+        """Verify count increments correctly."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        assert store.check_and_increment("telegram", "u1", limit=5)[1] == 1
+        assert store.check_and_increment("telegram", "u1", limit=5)[1] == 2
+        assert store.check_and_increment("telegram", "u1", limit=5)[1] == 3
+
+    def test_record_tokens_stores_usage(self, tmp_path):
+        """record_tokens then get_user_usage shows the tokens."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        store.record_tokens("telegram", "u1", input_tokens=100, output_tokens=50)
+        usage = store.get_user_usage("telegram", "u1", hours=24)
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 50
+        assert usage["request_count"] == 1
+
+    def test_record_tokens_accumulates(self, tmp_path):
+        """record 2x, get_user_usage shows sum."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        store.record_tokens("telegram", "u1", input_tokens=100, output_tokens=50)
+        store.record_tokens("telegram", "u1", input_tokens=50, output_tokens=25)
+        usage = store.get_user_usage("telegram", "u1", hours=24)
+        assert usage["input_tokens"] == 150
+        assert usage["output_tokens"] == 75
+        assert usage["request_count"] == 2
+
+    def test_record_tokens_with_model(self, tmp_path):
+        """model param stored."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        store.record_tokens(
+            "telegram", "u1", input_tokens=100, output_tokens=50, model="claude-3"
+        )
+        # Verify the record was created (model stored in DB, not returned by get_user_usage)
+        usage = store.get_user_usage("telegram", "u1", hours=24)
+        assert usage["request_count"] == 1
+
+    def test_get_user_usage_no_data(self, tmp_path):
+        """No records → zero values."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        usage = store.get_user_usage("telegram", "u1", hours=24)
+        assert usage["input_tokens"] == 0
+        assert usage["output_tokens"] == 0
+        assert usage["request_count"] == 0
+        assert usage["total_tokens"] == 0
+
+    def test_get_user_usage_respects_hours(self, tmp_path):
+        """Record old entry, set hours=1, old entry excluded."""
+        import time
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        # Record old token usage (2 hours ago)
+        old_timestamp = time.time() - (2 * 3600)
+        with store._lock:
+            conn = store._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO token_usage "
+                    "(timestamp, platform, user_id, input_tokens, output_tokens) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (old_timestamp, "telegram", "u1", 1000, 500),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        # Record recent usage
+        store.record_tokens("telegram", "u1", input_tokens=100, output_tokens=50)
+
+        # With hours=1, old entry excluded
+        usage_1h = store.get_user_usage("telegram", "u1", hours=1)
+        assert usage_1h["input_tokens"] == 100
+        assert usage_1h["request_count"] == 1
+
+        # With hours=24, all included
+        usage_24h = store.get_user_usage("telegram", "u1", hours=24)
+        assert usage_24h["input_tokens"] == 1100
+        assert usage_24h["request_count"] == 2
+
+    def test_get_all_user_usage(self, tmp_path):
+        """Record for 2 users, get_all returns both."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        store.record_tokens("telegram", "u1", input_tokens=100, output_tokens=50)
+        store.record_tokens("telegram", "u2", input_tokens=200, output_tokens=100)
+
+        all_usage = store.get_all_user_usage(hours=24)
+        assert len(all_usage) == 2
+        user_ids = {u["user_id"] for u in all_usage}
+        assert "u1" in user_ids
+        assert "u2" in user_ids
+
+    def test_get_all_user_usage_empty(self, tmp_path):
+        """No records → []."""
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        all_usage = store.get_all_user_usage(hours=24)
+        assert all_usage == []
+
+    def test_cleanup_removes_old_entries(self, tmp_path):
+        """Record, patch time, cleanup removes old entries."""
+        import time
+        from gateway.usage import UsageStore
+
+        store = UsageStore(db_path=str(tmp_path / "usage.db"))
+        # Record old token usage (100 days ago)
+        old_timestamp = time.time() - (100 * 86400)
+        with store._lock:
+            conn = store._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO token_usage "
+                    "(timestamp, platform, user_id, input_tokens, output_tokens) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (old_timestamp, "telegram", "u1", 1000, 500),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        # Record recent usage
+        store.record_tokens("telegram", "u1", input_tokens=100, output_tokens=50)
+
+        # Cleanup removes entries older than 30 days
+        store.cleanup(max_age_days=30)
+
+        # Only recent entry remains
+        usage = store.get_user_usage("telegram", "u1", hours=24)
+        assert usage["input_tokens"] == 100
+        assert usage["request_count"] == 1
+
+    def test_default_db_path(self, tmp_path):
+        """UsageStore() with no path uses get_hermes_home()."""
+        from gateway.usage import UsageStore
+        from unittest.mock import patch
+
+        # Use a real temporary directory that exists
+        with patch("hermes_constants.get_hermes_home") as mock_hermes_home:
+            mock_hermes_home.return_value = tmp_path
+            store = UsageStore()
+            assert store._db_path == str(tmp_path / "usage.db")
+
+
+class TestNullUsageStore:
+    """Tests for NullUsageStore - no-op usage tracking."""
+
+    def test_check_and_increment_returns_true(self):
+        """Always (True, 0)."""
+        from gateway.usage import NullUsageStore
+
+        store = NullUsageStore()
+        allowed, count = store.check_and_increment("telegram", "u1", limit=1)
+        assert allowed is True
+        assert count == 0
+
+    def test_record_tokens_does_nothing(self):
+        """No error."""
+        from gateway.usage import NullUsageStore
+
+        store = NullUsageStore()
+        # NullUsageStore.record_tokens only accepts **kwargs
+        store.record_tokens(
+            platform="telegram", user_id="u1", input_tokens=100, output_tokens=50
+        )
+        # Should not raise
+
+    def test_get_user_usage_returns_zeros(self):
+        """Returns {"input_tokens": 0, ...}."""
+        from gateway.usage import NullUsageStore
+
+        store = NullUsageStore()
+        # NullUsageStore.get_user_usage only accepts **kwargs
+        usage = store.get_user_usage(platform="telegram", user_id="u1", hours=24)
+        assert usage["request_count"] == 0
+        assert usage["input_tokens"] == 0
+        assert usage["output_tokens"] == 0
+        assert usage["total_tokens"] == 0
+
+    def test_get_all_user_usage_returns_empty(self):
+        """Returns []."""
+        from gateway.usage import NullUsageStore
+
+        store = NullUsageStore()
+        all_usage = store.get_all_user_usage(hours=24)
+        assert all_usage == []
+
+    def test_cleanup_does_nothing(self):
+        """No error, returns 0."""
+        from gateway.usage import NullUsageStore
+
+        store = NullUsageStore()
+        deleted = store.cleanup(max_age_days=30)
+        assert deleted == 0
+
+
+class TestUsageStoreIntegration:
+    """Integration tests: UsageStore with GatewayRunner."""
+
+    def test_runner_usage_store_null_when_no_config(self, tmp_path):
+        """No permission_tiers → NullUsageStore."""
+        from gateway.usage import NullUsageStore
+
+        runner = _make_runner(permission_tiers=None)
+        assert isinstance(runner._usage_store, NullUsageStore)
+
+    def test_runner_usage_store_real_with_config(self, tmp_path):
+        """usage_tracking config → UsageStore."""
+        from gateway.usage import UsageStore
+
+        config = _make_permission_config(
+            usage_tracking={"db_path": str(tmp_path / "usage.db")}
+        )
+        runner = _make_runner(permission_tiers=config)
+        assert isinstance(runner._usage_store, UsageStore)
+
+    def test_runner_usage_store_uses_config_db_path(self, tmp_path):
+        """Custom db_path."""
+        custom_path = str(tmp_path / "custom_usage.db")
+        config = _make_permission_config(usage_tracking={"db_path": custom_path})
+        runner = _make_runner(permission_tiers=config)
+        # If db_path is absolute, it's used directly; relative paths are joined with HERMES_HOME
+        # In this case, custom_path is already absolute (tmp_path / "custom_usage.db")
+        assert runner._usage_store._db_path == custom_path
+
+    def test_runner_usage_store_cached_property(self, tmp_path):
+        """Accessing twice returns same object."""
+        config = _make_permission_config(
+            usage_tracking={"db_path": str(tmp_path / "usage.db")}
+        )
+        runner = _make_runner(permission_tiers=config)
+        store1 = runner._usage_store
+        store2 = runner._usage_store
+        assert store1 is store2
+
+    def test_runner_usage_store_with_empty_tracking_dict(self, tmp_path):
+        """usage_tracking: {} → NullUsageStore."""
+        from gateway.usage import NullUsageStore
+
+        config = _make_permission_config(usage_tracking={})
+        runner = _make_runner(permission_tiers=config)
+        assert isinstance(runner._usage_store, NullUsageStore)
+
+
+# ------------------------------------------------------------------
+# Phase 3: Audit Log (AuditLog and NullAuditLog)
+# ------------------------------------------------------------------
+
+
+class TestAuditLog:
+    """Tests for AuditLog class (SQLite-backed audit trail)."""
+
+    @pytest.fixture
+    def audit_log(self, tmp_path):
+        from gateway.audit import AuditLog
+
+        db_path = tmp_path / "audit.db"
+        audit = AuditLog(db_path=str(db_path), max_rows=100_000)
+        yield audit
+        # No cleanup needed - SQLite handles connection closing
+
+    def test_log_writes_event(self, audit_log):
+        """Log one event, query returns it."""
+        audit_log.log(
+            event_type="command_denied",
+            platform="discord",
+            user_id="u1",
+            tier_name="restricted",
+            details="/model command blocked",
+        )
+        events = audit_log.query()
+        assert len(events) == 1
+        assert events[0]["event_type"] == "command_denied"
+        assert events[0]["platform"] == "discord"
+        assert events[0]["user_id"] == "u1"
+        assert events[0]["tier_name"] == "restricted"
+        assert events[0]["details"] == "/model command blocked"
+
+    def test_log_multiple_events(self, audit_log):
+        """Log 5 events, query returns all in DESC order."""
+        for i in range(5):
+            audit_log.log(event_type=f"event_{i}", user_id=f"u{i}")
+        events = audit_log.query()
+        assert len(events) == 5
+        # Should be in DESC order (newest first)
+        assert events[0]["event_type"] == "event_4"
+        assert events[4]["event_type"] == "event_0"
+
+    def test_log_stores_all_fields(self, audit_log):
+        """Log with all params, verify all fields present."""
+        audit_log.log(
+            event_type="tier_change",
+            platform="telegram",
+            user_id="u1",
+            tier_name="admin",
+            details="Promoted by owner",
+            actor_id="owner123",
+        )
+        events = audit_log.query()
+        assert len(events) == 1
+        e = events[0]
+        assert e["id"] >= 1
+        assert e["event_type"] == "tier_change"
+        assert e["platform"] == "telegram"
+        assert e["user_id"] == "u1"
+        assert e["tier_name"] == "admin"
+        assert e["details"] == "Promoted by owner"
+        assert e["actor_id"] == "owner123"
+        assert e["timestamp"] > 0
+
+    def test_query_by_event_type(self, audit_log):
+        """Log 3 different types, query by one type returns only matching."""
+        audit_log.log(event_type="command_denied", user_id="u1")
+        audit_log.log(event_type="tier_change", user_id="u2")
+        audit_log.log(event_type="command_denied", user_id="u3")
+        events = audit_log.query(event_type="command_denied")
+        assert len(events) == 2
+        for e in events:
+            assert e["event_type"] == "command_denied"
+
+    def test_query_by_user_id(self, audit_log):
+        """Log for 2 users, query by one user returns only their events."""
+        audit_log.log(event_type="event_1", user_id="u1")
+        audit_log.log(event_type="event_2", user_id="u2")
+        audit_log.log(event_type="event_3", user_id="u1")
+        events = audit_log.query(user_id="u1")
+        assert len(events) == 2
+        for e in events:
+            assert e["user_id"] == "u1"
+
+    def test_query_by_platform(self, audit_log):
+        """Log for 2 platforms, query by one returns only matching."""
+        audit_log.log(event_type="event_1", platform="discord")
+        audit_log.log(event_type="event_2", platform="telegram")
+        audit_log.log(event_type="event_3", platform="discord")
+        events = audit_log.query(platform="discord")
+        assert len(events) == 2
+        for e in events:
+            assert e["platform"] == "discord"
+
+    def test_query_limit(self, audit_log):
+        """Log 10 events, query with limit=3 returns 3."""
+        for i in range(10):
+            audit_log.log(event_type=f"event_{i}")
+        events = audit_log.query(limit=3)
+        assert len(events) == 3
+        # Should return newest 3
+        assert events[0]["event_type"] == "event_9"
+
+    def test_query_offset(self, audit_log):
+        """Log 5 events, query with limit=2 offset=2 returns 2."""
+        for i in range(5):
+            audit_log.log(event_type=f"event_{i}")
+        events = audit_log.query(limit=2, offset=2)
+        assert len(events) == 2
+        # Should skip newest 2, return next 2
+        assert events[0]["event_type"] == "event_2"
+        assert events[1]["event_type"] == "event_1"
+
+    def test_count_total(self, audit_log):
+        """Log 5 events, count returns 5."""
+        for i in range(5):
+            audit_log.log(event_type=f"event_{i}")
+        assert audit_log.count() == 5
+
+    def test_count_by_event_type(self, audit_log):
+        """Log 3 types, count by one type."""
+        audit_log.log(event_type="command_denied", user_id="u1")
+        audit_log.log(event_type="tier_change", user_id="u2")
+        audit_log.log(event_type="command_denied", user_id="u3")
+        assert audit_log.count(event_type="command_denied") == 2
+        assert audit_log.count(event_type="tier_change") == 1
+
+    def test_count_by_user_id(self, audit_log):
+        """Log for 2 users, count by one."""
+        audit_log.log(event_type="event_1", user_id="u1")
+        audit_log.log(event_type="event_2", user_id="u2")
+        audit_log.log(event_type="event_3", user_id="u1")
+        assert audit_log.count(user_id="u1") == 2
+        assert audit_log.count(user_id="u2") == 1
+
+    def test_count_returns_zero_for_no_match(self, audit_log):
+        """Count with non-existent filter."""
+        audit_log.log(event_type="event_1", user_id="u1")
+        assert audit_log.count(event_type="nonexistent") == 0
+        assert audit_log.count(user_id="nonexistent") == 0
+
+    def test_query_returns_empty_for_no_match(self, audit_log):
+        """Query with non-existent filter."""
+        audit_log.log(event_type="event_1", user_id="u1")
+        assert audit_log.query(event_type="nonexistent") == []
+        assert audit_log.query(user_id="nonexistent") == []
+
+    def test_rotation_keeps_newest_half(self, tmp_path):
+        """Set max_rows=4, log 10 events, verify only newest ~2 remain."""
+        from gateway.audit import AuditLog
+
+        db_path = tmp_path / "audit_rotate.db"
+        audit = AuditLog(db_path=str(db_path), max_rows=4)
+
+        # Log 10 events
+        for i in range(10):
+            audit.log(event_type=f"event_{i}", user_id="u1")
+
+        # Rotation should trigger on the last log call
+        # Count should be <= max_rows (4) since we keep newest half (2)
+        count = audit.count()
+        assert count <= 4
+
+        # Newest events should still be present
+        events = audit.query()
+        assert len(events) <= 4
+        # Most recent event should be event_9
+        assert events[0]["event_type"] == "event_9"
+
+    def test_log_handles_corrupt_db_gracefully(self, tmp_path, caplog):
+        """Log to a db that will fail rotation, should not raise."""
+        from gateway.audit import AuditLog
+
+        # Create a valid audit log
+        db_path = tmp_path / "audit_corrupt.db"
+        audit = AuditLog(db_path=str(db_path), max_rows=1)
+
+        # Log one event successfully
+        audit.log(event_type="test1", user_id="u1")
+
+        # Now set max_rows to 0 to force rotation failure
+        # Actually, let's use a different approach - delete the db file
+        db_path.unlink()
+
+        # Subsequent log should not raise, just log warning
+        with caplog.at_level(logging.WARNING):
+            audit.log(event_type="test2", user_id="u2")
+
+        # Should have logged a warning about the error
+        assert "Audit log write failed" in caplog.text
+
+    def test_default_db_path_uses_hermes_home(self, monkeypatch, tmp_path):
+        """AuditLog() with no path uses get_hermes_home()."""
+        from gateway.audit import AuditLog
+
+        # Mock HERMES_HOME to return tmp_path
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        # Create AuditLog with no db_path argument
+        audit = AuditLog()  # Should use default path from get_hermes_home()
+
+        # Log something to verify it works
+        audit.log(event_type="test", user_id="u1")
+        events = audit.query()
+        assert len(events) == 1
+
+        # Verify the db was created in HERMES_HOME
+        expected_path = tmp_path / "audit.db"
+        assert expected_path.exists()
+
+    def test_log_with_none_optional_fields(self, audit_log):
+        """Log with only event_type, other fields None."""
+        audit_log.log(event_type="minimal_event")
+        events = audit_log.query()
+        assert len(events) == 1
+        e = events[0]
+        assert e["event_type"] == "minimal_event"
+        assert e["platform"] is None
+        assert e["user_id"] is None
+        assert e["tier_name"] is None
+        assert e["details"] is None
+        assert e["actor_id"] is None
+
+
+class TestNullAuditLog:
+    """Tests for NullAuditLog (no-op stub)."""
+
+    def test_log_does_nothing(self):
+        """NullAuditLog().log() doesn't raise."""
+        from gateway.audit import NullAuditLog
+
+        audit = NullAuditLog()
+        # Should not raise any exception
+        audit.log(
+            event_type="test",
+            platform="discord",
+            user_id="u1",
+            tier_name="admin",
+            details="details",
+            actor_id="actor",
+        )
+
+    def test_query_returns_empty(self):
+        """NullAuditLog().query() returns []."""
+        from gateway.audit import NullAuditLog
+
+        audit = NullAuditLog()
+        result = audit.query()
+        assert result == []
+
+    def test_count_returns_zero(self):
+        """NullAuditLog().count() returns 0."""
+        from gateway.audit import NullAuditLog
+
+        audit = NullAuditLog()
+        assert audit.count() == 0
+
+    def test_query_with_filters_returns_empty(self):
+        """NullAuditLog().query(event_type="x") returns []."""
+        from gateway.audit import NullAuditLog
+
+        audit = NullAuditLog()
+        result = audit.query(event_type="command_denied", user_id="u1", limit=10)
+        assert result == []
+
+
+class TestAuditLogIntegration:
+    """Integration tests for AuditLog with GatewayRunner._audit_log."""
+
+    def test_runner_audit_log_returns_null_when_no_config(self):
+        """Runner without permission_tiers → NullAuditLog."""
+        from gateway.audit import NullAuditLog
+
+        runner = _make_runner(permission_tiers=None)
+        assert isinstance(runner._audit_log, NullAuditLog)
+
+    def test_runner_audit_log_returns_real_with_config(self):
+        """Runner with audit config → AuditLog."""
+        from gateway.audit import AuditLog
+
+        pt = _make_permission_config(audit={"db_path": "audit.db"})
+        runner = _make_runner(permission_tiers=pt)
+        assert isinstance(runner._audit_log, AuditLog)
+
+    def test_runner_audit_log_uses_config_db_path(self, tmp_path):
+        """Audit config with custom db_path."""
+        from gateway.audit import AuditLog
+
+        # Use absolute path (like UsageStore tests do)
+        custom_path = str(tmp_path / "custom_audit.db")
+        pt = _make_permission_config(audit={"db_path": custom_path})
+        runner = _make_runner(permission_tiers=pt)
+
+        assert isinstance(runner._audit_log, AuditLog)
+        # Log something to create the db file
+        runner._audit_log.log(event_type="test", user_id="u1")
+        # The db should be at the custom path
+        assert (tmp_path / "custom_audit.db").exists()
+
+    def test_runner_audit_log_uses_max_rows(self):
+        """Audit config with custom max_rows."""
+        from gateway.audit import AuditLog
+
+        pt = _make_permission_config(audit={"db_path": "audit.db", "max_rows": 50})
+        runner = _make_runner(permission_tiers=pt)
+
+        assert isinstance(runner._audit_log, AuditLog)
+        assert runner._audit_log._max_rows == 50
+
+    def test_runner_audit_log_cached_property(self):
+        """Accessing _audit_log twice returns same object."""
+        pt = _make_permission_config(audit={"db_path": "audit.db"})
+        runner = _make_runner(permission_tiers=pt)
+
+        audit1 = runner._audit_log
+        audit2 = runner._audit_log
+        assert audit1 is audit2  # Same object instance
+
+    def test_runner_audit_log_with_empty_audit_dict(self):
+        """audit: {} (truthy but no keys) → NullAuditLog."""
+        from gateway.audit import NullAuditLog
+
+        pt = _make_permission_config(audit={})
+        runner = _make_runner(permission_tiers=pt)
+        assert isinstance(runner._audit_log, NullAuditLog)
+
+
+# ------------------------------------------------------------------
+# Phase 3: Platform Role Resolution (T3/T4)
+# ------------------------------------------------------------------
+
+
+class TestPlatformRoleMapping:
+    """Tests for resolve_platform_role_tier method."""
+
+    def _make_source_with_roles(
+        self, user_id="u1", platform=Platform.DISCORD, user_roles=None
+    ):
+        """Helper to create SessionSource with user_roles."""
+        return SessionSource(
+            platform=platform,
+            user_id=user_id,
+            chat_id="c1",
+            user_name="tester",
+            chat_type="dm",
+            user_roles=user_roles,
+        )
+
+    def test_no_mapping_returns_none(self):
+        """No platform_role_mapping → returns None."""
+        pt = _make_permission_config(
+            platform_role_mapping=None,
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["administrator"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+    def test_no_user_roles_returns_none(self):
+        """user_roles=None → returns None."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin"}},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=None)
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+    def test_empty_user_roles_returns_none(self):
+        """user_roles=[] → returns None."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin"}},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=[])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+    def test_matching_role_returns_tier(self):
+        """Exact role match returns mapped tier."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin"}},
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["administrator"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier == "admin"
+
+    def test_first_match_wins(self):
+        """First matching role wins when user has multiple roles."""
+        pt = _make_permission_config(
+            platform_role_mapping={
+                "discord": {"moderator": "user", "administrator": "admin"}
+            },
+            tiers={"user": _restricted_tier(), "admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["moderator", "administrator"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier == "user"  # First match
+
+    def test_no_matching_role_returns_none(self):
+        """No matching role → None."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin"}},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["member"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+    def test_wildcard_matches_unmapped(self):
+        """Wildcard role * matches when no exact match found."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin", "*": "user"}},
+            tiers={"user": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["member"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier == "user"
+
+    def test_wildcard_not_used_if_exact_match(self):
+        """Wildcard not used when exact match exists."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin", "*": "user"}},
+            tiers={"admin": _admin_tier(), "user": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["administrator"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier == "admin"  # Exact match, not wildcard
+
+    def test_platform_specific_mapping(self):
+        """Different mappings for different platforms."""
+        pt = _make_permission_config(
+            platform_role_mapping={
+                "telegram": {"administrator": "admin"},
+                "discord": {"Admin": "admin"},
+            },
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(
+            platform=Platform.TELEGRAM, user_roles=["administrator"]
+        )
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier == "admin"
+
+    def test_default_fallback_mapping(self):
+        """default mapping used when platform-specific mapping missing."""
+        pt = _make_permission_config(
+            platform_role_mapping={
+                "default": {"*": "guest"},
+            },
+            tiers={"guest": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(
+            platform=Platform.SLACK, user_roles=["member"]
+        )
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier == "guest"
+
+    def test_invalid_tier_in_mapping_skipped(self, caplog):
+        """Invalid tier name in mapping is skipped with warning."""
+        import logging
+
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "nonexistent_tier"}},
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["administrator"])
+        with caplog.at_level(logging.WARNING):
+            tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+        assert "not defined, skipping" in caplog.text.lower()
+
+    def test_no_config_returns_none(self):
+        """PermissionManager with config=None returns None."""
+        runner = _make_runner(permission_tiers=None)
+        source = self._make_source_with_roles(user_roles=["administrator"])
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+    def test_wildcard_with_invalid_tier_skipped(self, caplog):
+        """Wildcard mapping with invalid tier is skipped."""
+        import logging
+
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"*": "invalid_tier"}},
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = self._make_source_with_roles(user_roles=["member"])
+        with caplog.at_level(logging.WARNING):
+            tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+    def test_platform_attribute_missing_returns_none(self):
+        """Source without platform attribute returns None."""
+        pt = _make_permission_config(
+            platform_role_mapping={"discord": {"administrator": "admin"}},
+            tiers={"admin": _admin_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        source = SimpleNamespace(
+            user_id="u1",
+            chat_id="c1",
+            user_roles=["administrator"],
+            # No platform attribute
+        )
+        tier = runner._permissions.resolve_platform_role_tier(source)
+        assert tier is None
+
+
+# ------------------------------------------------------------------
+# Phase 7e: Smart Denial Messages
+# ------------------------------------------------------------------
+
+
+class TestSmartDenialMessages:
+    """Tests for helpful denial messages with /whoami references."""
+
+    def test_exec_denied_suggests_whoami(self):
+        """exec_denied message contains /whoami reference."""
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        tier = runner._permissions.get_tier_config("restricted")
+        source = _make_source(user_id="u1")
+        msg = runner._permissions.format_tier_message(tier, "exec_denied", source)
+        assert "/whoami" in msg
+
+    def test_command_denied_suggests_whoami(self):
+        """command_denied message contains /whoami reference."""
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        tier = runner._permissions.get_tier_config("restricted")
+        source = _make_source(user_id="u1")
+        msg = runner._permissions.format_tier_message(tier, "command_denied", source)
+        assert "/whoami" in msg
+
+    def test_rate_limited_mentions_reset(self):
+        """rate_limited message mentions reset."""
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        tier = runner._permissions.get_tier_config("restricted")
+        source = _make_source(user_id="u1")
+        msg = runner._permissions.format_tier_message(tier, "rate_limited", source)
+        assert "reset" in msg.lower()
+
+    def test_generic_denial_suggests_whoami(self):
+        """Unknown key returns generic message with /whoami reference."""
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        tier = runner._permissions.get_tier_config("restricted")
+        source = _make_source(user_id="u1")
+        msg = runner._permissions.format_tier_message(tier, "unknown_key", source)
+        assert "/whoami" in msg
+
+    def test_exec_denied_mentions_admin(self):
+        """exec_denied message mentions admin."""
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        tier = runner._permissions.get_tier_config("restricted")
+        source = _make_source(user_id="u1")
+        msg = runner._permissions.format_tier_message(tier, "exec_denied", source)
+        assert "admin" in msg.lower()
+
+    def test_command_denied_mentions_admin(self):
+        """command_denied message mentions admin."""
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        runner = _make_runner(permission_tiers=pt)
+        tier = runner._permissions.get_tier_config("restricted")
+        source = _make_source(user_id="u1")
+        msg = runner._permissions.format_tier_message(tier, "command_denied", source)
+        assert "admin" in msg.lower()
+
+    def test_build_tier_context_includes_behavioral_guidance(self):
+        """build_tier_context includes helpful alternative guidance."""
+        from gateway.permissions import PermissionManager
+
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        pm = PermissionManager(pt)
+        tier_cfg = pm.get_tier_config("restricted")
+        context = pm.build_tier_context("restricted", tier_cfg)
+        assert context is not None
+        assert "helpful alternative" in context.lower()
+        assert "acknowledge" in context.lower()
+
+    def test_build_tier_context_includes_acknowledge_step(self):
+        """build_tier_context includes acknowledge step."""
+        from gateway.permissions import PermissionManager
+
+        pt = _make_permission_config(
+            tiers={"restricted": _restricted_tier()},
+        )
+        pm = PermissionManager(pt)
+        tier_cfg = pm.get_tier_config("restricted")
+        context = pm.build_tier_context("restricted", tier_cfg)
+        assert context is not None
+        assert "Acknowledge" in context
+
+
+# ------------------------------------------------------------------
+# Phase 7d: PromoteRequestStore
+# ------------------------------------------------------------------
+
+
+class TestPromoteRequestStore:
+    """Tests for PromoteRequestStore SQLite-backed promotion requests."""
+
+    def test_create_request_returns_dict(self, tmp_path):
+        """create_request returns dict with expected keys."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        result = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        assert result is not None
+        assert "id" in result
+        assert "user_id" in result
+        assert "platform" in result
+        assert "requested_tier" in result
+        assert "current_tier" in result
+        assert "status" in result
+        assert "created_at" in result
+
+    def test_create_request_generates_unique_id(self, tmp_path):
+        """Two create_requests generate different IDs."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req1 = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        req2 = store.create_request(
+            user_id="u2", platform="discord", requested_tier="admin"
+        )
+        assert req1["id"] != req2["id"]
+
+    def test_create_request_duplicate_returns_none(self, tmp_path):
+        """Same user+platform with pending returns None."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req1 = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        assert req1 is not None
+        # Duplicate request (same user, same platform, still pending)
+        req2 = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        assert req2 is None
+
+    def test_get_request_returns_created(self, tmp_path):
+        """create then get by id returns same request."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        created = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        retrieved = store.get_request(created["id"])
+        assert retrieved is not None
+        assert retrieved["user_id"] == "u1"
+        assert retrieved["platform"] == "discord"
+        assert retrieved["requested_tier"] == "admin"
+
+    def test_get_request_nonexistent_returns_none(self, tmp_path):
+        """get with bad id returns None."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        result = store.get_request("nonexistent_id")
+        assert result is None
+
+    def test_list_pending_returns_pending(self, tmp_path):
+        """list_pending returns all pending requests."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        store.create_request(user_id="u1", platform="discord", requested_tier="admin")
+        store.create_request(user_id="u2", platform="telegram", requested_tier="user")
+        pending = store.list_pending()
+        assert len(pending) == 2
+        assert all(r["status"] == "pending" for r in pending)
+
+    def test_list_pending_excludes_resolved(self, tmp_path):
+        """list_pending excludes approved/denied requests."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req1 = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        store.create_request(user_id="u2", platform="telegram", requested_tier="user")
+        # Approve one
+        store.approve_request(req1["id"], resolved_by="admin")
+        pending = store.list_pending()
+        assert len(pending) == 1
+        assert pending[0]["user_id"] == "u2"
+
+    def test_approve_request_updates_status(self, tmp_path):
+        """approve updates status to approved."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        updated = store.approve_request(req["id"], resolved_by="admin")
+        assert updated is not None
+        assert updated["status"] == "approved"
+
+    def test_approve_request_stores_approver(self, tmp_path):
+        """approve stores resolved_by field."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        updated = store.approve_request(req["id"], resolved_by="owner123")
+        assert updated is not None
+        assert updated["resolved_by"] == "owner123"
+
+    def test_approve_nonexistent_returns_false(self, tmp_path):
+        """approve with bad id returns None (not False - method returns Optional[Dict])."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        result = store.approve_request("bad_id", resolved_by="admin")
+        assert result is None
+
+    def test_deny_request_updates_status(self, tmp_path):
+        """deny updates status to denied."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        updated = store.deny_request(req["id"], resolved_by="admin")
+        assert updated is not None
+        assert updated["status"] == "denied"
+
+    def test_deny_request_stores_denier(self, tmp_path):
+        """deny stores resolved_by field."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        req = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        updated = store.deny_request(req["id"], resolved_by="owner123")
+        assert updated is not None
+        assert updated["resolved_by"] == "owner123"
+
+    def test_deny_nonexistent_returns_false(self, tmp_path):
+        """deny with bad id returns None (not False)."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+        result = store.deny_request("bad_id", resolved_by="admin")
+        assert result is None
+
+    def test_cleanup_removes_old_pending(self, tmp_path):
+        """cleanup_expired removes pending requests older than max_age_hours."""
+        import time
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+
+        # Create one old request (100 hours ago)
+        with patch("time.time", return_value=time.time() - 360000):
+            old_req = store.create_request(
+                user_id="u1", platform="discord", requested_tier="admin"
+            )
+
+        # Create one recent request
+        recent_req = store.create_request(
+            user_id="u2", platform="discord", requested_tier="admin"
+        )
+
+        # Cleanup pending older than 72 hours
+        removed = store.cleanup_expired(max_age_hours=72)
+        assert removed == 1
+
+        # Old request gone, recent remains
+        assert store.get_request(old_req["id"]) is None
+        assert store.get_request(recent_req["id"]) is not None
+
+    def test_allow_new_after_approval(self, tmp_path):
+        """After approval, new request for same user is allowed."""
+        from gateway.permissions import PromoteRequestStore
+
+        db_path = tmp_path / "promote.db"
+        store = PromoteRequestStore(db_path=str(db_path))
+
+        req1 = store.create_request(
+            user_id="u1", platform="discord", requested_tier="admin"
+        )
+        assert req1 is not None
+
+        # Approve it
+        store.approve_request(req1["id"], resolved_by="admin")
+
+        # New request for same user should succeed (old one resolved)
+        req2 = store.create_request(
+            user_id="u1", platform="discord", requested_tier="user"
+        )
+        assert req2 is not None
+        assert req2["id"] != req1["id"]
+
+
+# ------------------------------------------------------------------
+# Phase 7c: MCP default-deny logic (is_elevated_tier)
+# ------------------------------------------------------------------
+
+
+class TestIsElevatedTier:
+    """Tests for is_elevated_tier() method — T7c: MCP default-deny logic."""
+
+    def test_no_tier_config_returns_true(self):
+        """Non-existent tier name → True (no config = unrestricted)."""
+        runner = _make_runner(permission_tiers=None)
+        assert runner._permissions.is_elevated_tier("nonexistent") is True
+
+    def test_wildcard_resolved_tools_is_elevated(self):
+        """resolved_tools={"*"} → True."""
+        tier = TierDefinition(
+            allowed_tools=["@all"],
+            resolved_tools=frozenset({"*"}),
+        )
+        pt = _make_permission_config(tiers={"wildcard": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("wildcard") is True
+
+    def test_mcp_pattern_in_resolved_tools_is_elevated(self):
+        """resolved_tools={"terminal", "mcp:server:tool"} → True."""
+        tier = TierDefinition(
+            allowed_tools=["terminal", "mcp:server:tool"],
+            resolved_tools=frozenset({"terminal", "mcp:server:tool"}),
+        )
+        pt = _make_permission_config(tiers={"with_mcp": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("with_mcp") is True
+
+    def test_no_mcp_in_resolved_tools_not_elevated(self):
+        """resolved_tools={"terminal", "web_search"} → False."""
+        tier = TierDefinition(
+            allowed_toolsets=[],  # Explicitly empty to avoid wildcard default
+            allowed_tools=["terminal", "web_search"],
+            resolved_tools=frozenset({"terminal", "web_search"}),
+        )
+        pt = _make_permission_config(tiers={"no_mcp": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("no_mcp") is False
+
+    def test_mcp_at_group_in_allowed_tools_is_elevated(self):
+        """allowed_tools=["@mcp"] → True."""
+        tier = TierDefinition(
+            allowed_toolsets=[],
+            allowed_tools=["@mcp"],
+        )
+        pt = _make_permission_config(tiers={"mcp_group": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("mcp_group") is True
+
+    def test_all_at_group_in_allowed_tools_is_elevated(self):
+        """allowed_tools=["@all"] → True."""
+        tier = TierDefinition(
+            allowed_toolsets=[],
+            allowed_tools=["@all"],
+        )
+        pt = _make_permission_config(tiers={"all_group": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("all_group") is True
+
+    def test_mcp_prefix_in_allowed_tools_is_elevated(self):
+        """allowed_tools=["mcp:server"] → True."""
+        tier = TierDefinition(
+            allowed_toolsets=[],
+            allowed_tools=["mcp:server"],
+        )
+        pt = _make_permission_config(tiers={"mcp_prefix": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("mcp_prefix") is True
+
+    def test_no_mcp_in_allowed_tools_not_elevated(self):
+        """allowed_tools=["@web", "@code"] → False."""
+        tier = TierDefinition(
+            allowed_toolsets=[],
+            allowed_tools=["@web", "@code"],
+        )
+        pt = _make_permission_config(tiers={"no_mcp_tools": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("no_mcp_tools") is False
+
+    def test_mcp_in_allowed_toolsets_is_elevated(self):
+        """allowed_toolsets=["@mcp"] → True."""
+        tier = TierDefinition(allowed_toolsets=["@mcp"])
+        pt = _make_permission_config(tiers={"mcp_toolset": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("mcp_toolset") is True
+
+    def test_wildcard_in_allowed_toolsets_is_elevated(self):
+        """allowed_toolsets=["*"] → True."""
+        tier = TierDefinition(allowed_toolsets=["*"])
+        pt = _make_permission_config(tiers={"wildcard_toolset": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("wildcard_toolset") is True
+
+    def test_no_mcp_in_allowed_toolsets_not_elevated(self):
+        """allowed_toolsets=["@web"] → False."""
+        tier = TierDefinition(allowed_toolsets=["@web"])
+        pt = _make_permission_config(tiers={"no_mcp_toolset": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("no_mcp_toolset") is False
+
+    def test_empty_resolved_tools_not_elevated(self):
+        """resolved_tools=set() → False."""
+        tier = TierDefinition(
+            allowed_toolsets=[],
+            allowed_tools=[],
+            resolved_tools=frozenset(),
+        )
+        pt = _make_permission_config(tiers={"empty_tools": tier})
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("empty_tools") is False
+
+    def test_guest_tier_not_elevated(self):
+        """Build guest tier from BUILTIN_TIER_PRESETS → not elevated."""
+        from gateway.config import BUILTIN_TIER_PRESETS
+
+        guest_preset = BUILTIN_TIER_PRESETS["guest"]
+        # Add empty allowed_toolsets to avoid wildcard default
+        guest_preset["allowed_toolsets"] = []
+        pt = PermissionTiersConfig.from_dict(
+            {
+                "default_tier": "guest",
+                "tiers": {"guest": guest_preset},
+                "users": {},
+            }
+        )
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("guest") is False
+
+    def test_admin_tier_is_elevated(self):
+        """Build admin tier from BUILTIN_TIER_PRESETS → elevated (has @mcp)."""
+        from gateway.config import BUILTIN_TIER_PRESETS
+
+        admin_preset = BUILTIN_TIER_PRESETS["admin"]
+        pt = PermissionTiersConfig.from_dict(
+            {
+                "default_tier": "admin",
+                "tiers": {"admin": admin_preset},
+                "users": {},
+            }
+        )
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("admin") is True
+
+    def test_owner_tier_is_elevated(self):
+        """Build owner tier from BUILTIN_TIER_PRESETS → elevated (has *)."""
+        from gateway.config import BUILTIN_TIER_PRESETS
+
+        owner_preset = BUILTIN_TIER_PRESETS["owner"]
+        pt = PermissionTiersConfig.from_dict(
+            {
+                "default_tier": "owner",
+                "tiers": {"owner": owner_preset},
+                "users": {},
+            }
+        )
+        runner = _make_runner(permission_tiers=pt)
+        assert runner._permissions.is_elevated_tier("owner") is True
