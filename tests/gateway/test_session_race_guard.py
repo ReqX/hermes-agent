@@ -32,7 +32,7 @@ class _FakeAdapter:
 def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
     )
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
     runner._running_agents = {}
@@ -45,9 +45,7 @@ def _make_runner():
 
 
 def _make_event(text="hello", chat_id="12345"):
-    source = SessionSource(
-        platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"
-    )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm")
     return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
 
 
@@ -177,12 +175,8 @@ async def test_command_messages_do_not_leave_sentinel():
     """Slash commands (/help, /status, etc.) return early from
     _handle_message.  They must NOT leave a sentinel behind."""
     runner = _make_runner()
-    source = SessionSource(
-        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"
-    )
-    event = MessageEvent(
-        text="/help", message_type=MessageType.TEXT, source=source
-    )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+    event = MessageEvent(text="/help", message_type=MessageType.TEXT, source=source)
     session_key = build_session_key(source)
 
     # Mock the help handler to avoid needing full runner setup
@@ -331,8 +325,10 @@ async def test_shutdown_skips_sentinel():
     runner._exit_reason = None
     runner._shutdown_all_gateway_honcho = lambda: None
 
-    with patch("gateway.status.remove_pid_file"), \
-         patch("gateway.status.write_runtime_status"):
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+    ):
         await runner.stop()
 
     # Real agent should have been interrupted
