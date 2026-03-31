@@ -13,12 +13,154 @@ import os
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, FrozenSet, List, Optional, Set, Any
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tool groups — @group shorthand syntax for permission tier configs
+# ---------------------------------------------------------------------------
+
+TOOL_GROUPS: Dict[str, List[str]] = {
+    # --- Capability groups (individual tools) ---
+    "@web": ["web_search", "web_extract"],
+    "@read": ["read_file", "search_files"],
+    "@write": ["write_file", "patch"],
+    "@media": ["vision_analyze", "image_generate", "text_to_speech"],
+    "@code": ["terminal", "execute_code"],
+    "@system": ["cronjob", "delegate_task"],
+    "@memory": ["memory", "session_search"],
+    "@skills": ["skills_list", "skill_view"],
+    "@browser": [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_scroll",
+        "browser_back",
+        "browser_press",
+        "browser_close",
+        "browser_get_images",
+        "browser_vision",
+        "browser_console",
+    ],
+    "@messaging": ["send_message"],
+    "@planning": ["todo"],
+    "@clarify": ["clarify"],
+    "@honcho": ["honcho_context", "honcho_profile", "honcho_search", "honcho_conclude"],
+    "@homeassistant": [
+        "ha_list_entities",
+        "ha_get_state",
+        "ha_list_services",
+        "ha_call_service",
+    ],
+    # --- Composite groups (reference other groups) ---
+    "@safe": [
+        # @web + @read + @media + @skills + clarify
+        "@web",
+        "@read",
+        "@media",
+        "@skills",
+        "clarify",
+    ],
+    "@all": ["*"],
+}
+
+
+def _expand_tool_groups(entries: List[str]) -> Set[str]:
+    """Expand @group references in a list of tool names.
+
+    - Entries starting with ``@`` are looked up in ``TOOL_GROUPS``.
+    - ``@all`` expands to ``{"*"}`` (all tools).
+    - Unknown ``@``-prefixed entries are logged as warnings and skipped.
+    - Plain tool names are passed through unchanged.
+    - Recursive expansion: if a group contains another @group ref,
+      it is expanded again.
+    """
+    resolved: Set[str] = set()
+    _seen_groups: Set[str] = set()  # cycle guard
+
+    def _expand_one(item: str) -> None:
+        if not item.startswith("@"):
+            resolved.add(item)
+            return
+        if item in _seen_groups:
+            logger.warning("TOOL_GROUPS: cycle detected for '%s', skipping", item)
+            return
+        _seen_groups.add(item)
+        members = TOOL_GROUPS.get(item)
+        if members is None:
+            logger.warning(
+                "TOOL_GROUPS: unknown group '%s', skipping. Available groups: %s",
+                item,
+                sorted(TOOL_GROUPS.keys()),
+            )
+            return
+        for member in members:
+            _expand_one(member)
+
+    for entry in entries:
+        _expand_one(entry)
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Built-in tier presets
+# ---------------------------------------------------------------------------
+
+BUILTIN_TIER_PRESETS: Dict[str, Dict[str, Any]] = {
+    "owner": {
+        "allowed_tools": ["@all"],
+        "allow_exec": True,
+        "allow_admin_commands": True,
+    },
+    "admin": {
+        "allowed_tools": [
+            "@web",
+            "@read",
+            "@write",
+            "@code",
+            "@system",
+            "@media",
+            "@browser",
+            "@skills",
+            "@memory",
+            "@messaging",
+            "@planning",
+            "@clarify",
+            "@honcho",
+            "@homeassistant",
+            "mixture_of_agents",
+        ],
+        "allow_exec": True,
+        "allow_admin_commands": True,
+    },
+    "user": {
+        "allowed_tools": [
+            "@web",
+            "@read",
+            "@media",
+            "@skills",
+            "@memory",
+            "@planning",
+            "@clarify",
+            "mixture_of_agents",
+        ],
+        "allow_exec": False,
+        "allow_admin_commands": False,
+    },
+    "guest": {
+        "allowed_tools": ["@clarify"],
+        "allow_exec": False,
+        "allow_admin_commands": False,
+        "requests_per_hour": 10,
+    },
+}
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -27,16 +169,9 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
         return default
     if isinstance(value, bool):
         return value
-    if isinstance(value, int):
-        return value != 0
     if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in ("true", "1", "yes", "on"):
-            return True
-        if lowered in ("false", "0", "no", "off"):
-            return False
-        return default
-    return default
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
 
 
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
@@ -50,6 +185,7 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
 
 class Platform(Enum):
     """Supported messaging platforms."""
+
     LOCAL = "local"
     TELEGRAM = "telegram"
     DISCORD = "discord"
@@ -68,25 +204,55 @@ class Platform(Enum):
     WECOM = "wecom"
 
 
+# Platform → ALLOWED_USERS env var name (shared by _is_user_authorized and auto-tier)
+PLATFORM_ALLOWED_USERS_ENV: Dict["Platform", str] = {
+    Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
+    Platform.DISCORD: "DISCORD_ALLOWED_USERS",
+    Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
+    Platform.SLACK: "SLACK_ALLOWED_USERS",
+    Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
+    Platform.EMAIL: "EMAIL_ALLOWED_USERS",
+    Platform.SMS: "SMS_ALLOWED_USERS",
+    Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
+    Platform.MATRIX: "MATRIX_ALLOWED_USERS",
+    Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
+}
+
+# Platform → ALLOW_ALL_USERS env var name
+PLATFORM_ALLOW_ALL_ENV: Dict["Platform", str] = {
+    Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
+    Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
+    Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
+    Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
+    Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
+    Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
+    Platform.SMS: "SMS_ALLOW_ALL_USERS",
+    Platform.MATTERMOST: "MATTERMOST_ALLOW_ALL_USERS",
+    Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
+    Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
+}
+
+
 @dataclass
 class HomeChannel:
     """
     Default destination for a platform.
-    
+
     When a cron job specifies deliver="telegram" without a specific chat ID,
     messages are sent to this home channel.
     """
+
     platform: Platform
     chat_id: str
     name: str  # Human-readable name for display
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "name": self.name,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
         return cls(
@@ -100,19 +266,23 @@ class HomeChannel:
 class SessionResetPolicy:
     """
     Controls when sessions reset (lose context).
-    
+
     Modes:
     - "daily": Reset at a specific hour each day
     - "idle": Reset after N minutes of inactivity
     - "both": Whichever triggers first (daily boundary OR idle timeout)
     - "none": Never auto-reset (context managed only by compression)
     """
+
     mode: str = "both"  # "daily", "idle", "both", or "none"
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
-    
+    notify_exclude_platforms: tuple = (
+        "api_server",
+        "webhook",
+    )  # Platforms that don't get reset notifications
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
@@ -121,7 +291,7 @@ class SessionResetPolicy:
             "notify": self.notify,
             "notify_exclude_platforms": list(self.notify_exclude_platforms),
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionResetPolicy":
         # Handle both missing keys and explicit null values (YAML null → None)
@@ -135,27 +305,30 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=notify if notify is not None else True,
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude)
+            if exclude is not None
+            else ("api_server", "webhook"),
         )
 
 
 @dataclass
 class PlatformConfig:
     """Configuration for a single messaging platform."""
+
     enabled: bool = False
     token: Optional[str] = None  # Bot token (Telegram, Discord)
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
-    
+
     # Reply threading mode (Telegram/Slack)
     # - "off": Never thread replies to original message
     # - "first": Only first chunk threads to user's message (default)
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
-    
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "enabled": self.enabled,
@@ -169,13 +342,13 @@ class PlatformConfig:
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
         return result
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
         home_channel = None
         if "home_channel" in data:
             home_channel = HomeChannel.from_dict(data["home_channel"])
-        
+
         return cls(
             enabled=data.get("enabled", False),
             token=data.get("token"),
@@ -189,11 +362,12 @@ class PlatformConfig:
 @dataclass
 class StreamingConfig:
     """Configuration for real-time token streaming to messaging platforms."""
+
     enabled: bool = False
-    transport: str = "edit"       # "edit" (progressive editMessageText) or "off"
-    edit_interval: float = 0.3    # Seconds between message edits
-    buffer_threshold: int = 40    # Chars before forcing an edit
-    cursor: str = " ▉"           # Cursor shown during streaming
+    transport: str = "edit"  # "edit" (progressive editMessageText) or "off"
+    edit_interval: float = 0.3  # Seconds between message edits
+    buffer_threshold: int = 40  # Chars before forcing an edit
+    cursor: str = " ▉"  # Cursor shown during streaming
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -218,29 +392,348 @@ class StreamingConfig:
 
 
 @dataclass
+class TimeRestrictions:
+    """Time window during which a tier is active."""
+
+    start: str = "08:00"  # HH:MM
+    end: str = "22:00"  # HH:MM (supports cross-midnight, e.g. "22:00")
+    timezone: str = "UTC"
+    days: Optional[List[int]] = None  # 0=Mon..6=Sun, None=all
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "start": self.start,
+            "end": self.end,
+            "timezone": self.timezone,
+        }
+        if self.days is not None:
+            result["days"] = self.days
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TimeRestrictions":
+        if not data:
+            return cls()
+        start = data.get("start", "08:00")
+        end = data.get("end", "22:00")
+        if start == end:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "TimeRestrictions: start == end (%s), which means always restricted "
+                "(zero-length window). If you want 24h access, omit time_restrictions.",
+                start,
+            )
+        days = data.get("days")
+        if days is not None:
+            valid_days = [d for d in days if isinstance(d, int) and 0 <= d <= 6]
+            if len(valid_days) != len(days):
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "TimeRestrictions: days contains out-of-range values %s, "
+                    "filtered to %s (valid range: 0=Mon..6=Sun)",
+                    days,
+                    valid_days,
+                )
+            days = valid_days
+        return cls(
+            start=start,
+            end=end,
+            timezone=data.get("timezone", "UTC"),
+            days=days,
+        )
+
+
+@dataclass
+class TierDefinition:
+    """Permission settings for a single tier."""
+
+    allowed_toolsets: List[str] = field(default_factory=lambda: ["*"])
+    allowed_tools: Optional[List[str]] = (
+        None  # Tool-level filter (overrides toolsets when set)
+    )
+    resolved_tools: Optional[FrozenSet[str]] = (
+        None  # Expanded tool names after @group resolution
+    )
+    allow_exec: bool = True
+    allow_admin_commands: bool = True
+    time_restrictions: Optional[TimeRestrictions] = None
+    requests_per_hour: Optional[int] = None  # Rate limit: null = unlimited
+    messages: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "allowed_toolsets": self.allowed_toolsets,
+            "allow_exec": self.allow_exec,
+            "allow_admin_commands": self.allow_admin_commands,
+        }
+        if self.allowed_tools is not None:
+            result["allowed_tools"] = self.allowed_tools
+        if self.time_restrictions is not None:
+            result["time_restrictions"] = self.time_restrictions.to_dict()
+        if self.requests_per_hour is not None:
+            result["requests_per_hour"] = self.requests_per_hour
+        if self.messages:
+            result["messages"] = self.messages
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TierDefinition":
+        if not data:
+            return cls()
+        # Validate allowed_toolsets type — fail-closed on wrong type
+        raw_toolsets = data.get("allowed_toolsets")
+        if raw_toolsets is None:
+            allowed_toolsets = ["*"]
+        elif isinstance(raw_toolsets, list):
+            allowed_toolsets = [str(t) for t in raw_toolsets]
+        else:
+            logger.warning(
+                "TierDefinition: allowed_toolsets must be a list, got %s; "
+                "defaulting to [] (fail-closed)",
+                type(raw_toolsets).__name__,
+            )
+            allowed_toolsets = []
+
+        # Tool-level filtering: allowed_tools with @group expansion
+        raw_tools = data.get("allowed_tools")
+        allowed_tools: Optional[List[str]] = None
+        resolved_tools: Optional[FrozenSet[str]] = None
+        if raw_tools is not None:
+            if isinstance(raw_tools, list):
+                allowed_tools = [str(t) for t in raw_tools]
+                resolved_tools = frozenset(_expand_tool_groups(allowed_tools))
+            else:
+                logger.warning(
+                    "TierDefinition: allowed_tools must be a list, got %s; "
+                    "ignoring (fail-closed, will use toolsets instead)",
+                    type(raw_tools).__name__,
+                )
+
+        tr = data.get("time_restrictions")
+
+        # Rate limit: requests_per_hour (must be positive int, null = unlimited)
+        raw_rph = data.get("requests_per_hour")
+        requests_per_hour: Optional[int] = None
+        if raw_rph is not None:
+            try:
+                rph_val = int(raw_rph)
+                if rph_val > 0:
+                    requests_per_hour = rph_val
+                elif rph_val == 0:
+                    requests_per_hour = 0  # Explicitly blocked
+                else:
+                    logger.warning(
+                        "TierDefinition: requests_per_hour must be >= 0, got %s; "
+                        "treating as unlimited",
+                        raw_rph,
+                    )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "TierDefinition: requests_per_hour must be an integer, got %s; "
+                    "treating as unlimited",
+                    raw_rph,
+                )
+
+        return cls(
+            allowed_toolsets=allowed_toolsets,
+            allowed_tools=allowed_tools,
+            resolved_tools=resolved_tools,
+            allow_exec=_coerce_bool(data.get("allow_exec"), default=True),
+            allow_admin_commands=_coerce_bool(
+                data.get("allow_admin_commands"), default=True
+            ),
+            time_restrictions=TimeRestrictions.from_dict(tr) if tr else None,
+            requests_per_hour=requests_per_hour,
+            messages=data.get("messages", {}),
+        )
+
+
+@dataclass
+class UserTierConfig:
+    """Maps a single user (by platform ID) to a tier and locale."""
+
+    tier: Optional[str] = None
+    locale: str = "en"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tier": self.tier,
+            "locale": self.locale,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserTierConfig":
+        if not data:
+            return cls()
+        return cls(
+            tier=data.get("tier"),
+            locale=data.get("locale", "en"),
+        )
+
+
+@dataclass
+class PermissionTiersConfig:
+    """Top-level permission tiers configuration (opt-in)."""
+
+    default_tier: str = "admin"
+    tiers: Dict[str, TierDefinition] = field(default_factory=dict)
+    users: Dict[str, UserTierConfig] = field(default_factory=dict)
+    builtins: bool = (
+        True  # When True, preset tiers (owner/admin/user/guest) are available
+    )
+    # Phase 10: Auto-tier from env vars and pairing
+    auto_tier: bool = False  # Master switch — must be explicitly enabled
+    env_owner_tier: str = "owner"  # Tier for first entry in *_ALLOWED_USERS
+    env_default_tier: str = "admin"  # Tier for remaining entries in *_ALLOWED_USERS
+    pairing_default_tier: str = "user"  # Tier for pairing-approved users
+    env_open_tier: str = "guest"  # Tier for ALLOW_ALL_USERS (open access)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "default_tier": self.default_tier,
+            "tiers": {name: tier.to_dict() for name, tier in self.tiers.items()},
+            "users": {uid: ucfg.to_dict() for uid, ucfg in self.users.items()},
+            "builtins": self.builtins,
+            "auto_tier": self.auto_tier,
+            "env_owner_tier": self.env_owner_tier,
+            "env_default_tier": self.env_default_tier,
+            "pairing_default_tier": self.pairing_default_tier,
+            "env_open_tier": self.env_open_tier,
+        }
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PermissionTiersConfig":
+        if not data:
+            return cls()
+        builtins = _coerce_bool(data.get("builtins"), default=True)
+        tiers: Dict[str, TierDefinition] = {}
+
+        # --- Built-in preset tiers (user-defined tiers override these) ---
+        if builtins:
+            for preset_name, preset_data in BUILTIN_TIER_PRESETS.items():
+                tiers[preset_name] = TierDefinition.from_dict(preset_data)
+
+        # --- User-defined tiers (override presets with same name) ---
+        for tier_name, tier_data in data.get("tiers", {}).items():
+            tiers[tier_name] = TierDefinition.from_dict(tier_data)
+
+        users = {}
+        for user_id, user_data in data.get("users", {}).items():
+            users[user_id] = UserTierConfig.from_dict(user_data)
+        default_tier = data.get("default_tier", "admin")
+        # Fail-closed: ensure referenced tiers exist. If a tier name is
+        # missing (typo, stale config), inject the MOST restrictive
+        # definition — empty toolsets, no exec, no admin — so the user
+        # is locked out rather than silently elevated.
+        _restrictive = TierDefinition(
+            allowed_toolsets=[],
+            allow_exec=False,
+            allow_admin_commands=False,
+        )
+        if default_tier not in tiers:
+            logger.warning(
+                "Permission tier '%s' (default_tier) not defined — "
+                "injecting restrictive fallback",
+                default_tier,
+            )
+            tiers[default_tier] = TierDefinition(**_restrictive.to_dict())
+        for uid, ucfg in users.items():
+            if ucfg.tier not in tiers:
+                logger.warning(
+                    "Permission tier '%s' (user '%s') not defined — "
+                    "injecting restrictive fallback",
+                    ucfg.tier,
+                    uid,
+                )
+                tiers[ucfg.tier] = TierDefinition(**_restrictive.to_dict())
+
+        # --- Phase 10: Auto-tier from env vars ---
+        auto_tier = _coerce_bool(data.get("auto_tier"), default=False)
+        env_owner_tier = data.get("env_owner_tier", "owner")
+        env_default_tier = data.get("env_default_tier", "admin")
+        pairing_default_tier = data.get("pairing_default_tier", "user")
+        env_open_tier = data.get("env_open_tier", "guest")
+
+        # Fail-closed: validate auto-tier tier references exist
+        if auto_tier:
+            for label, tier_name in [
+                ("env_owner_tier", env_owner_tier),
+                ("env_default_tier", env_default_tier),
+                ("pairing_default_tier", pairing_default_tier),
+                ("env_open_tier", env_open_tier),
+            ]:
+                if tier_name not in tiers:
+                    logger.warning(
+                        "Auto-tier: %s '%s' not defined — "
+                        "auto_tier disabled. Define this tier or change the reference.",
+                        label,
+                        tier_name,
+                    )
+                    auto_tier = False
+                    break
+
+        return cls(
+            default_tier=default_tier,
+            tiers=tiers,
+            users=users,
+            builtins=builtins,
+            auto_tier=auto_tier,
+            env_owner_tier=env_owner_tier,
+            env_default_tier=env_default_tier,
+            pairing_default_tier=pairing_default_tier,
+            env_open_tier=env_open_tier,
+        )
+
+
+def _build_permission_tiers(
+    data: Dict[str, Any], logger
+) -> Optional["PermissionTiersConfig"]:
+    """Resolve permission_tiers from raw config data.
+
+    Returns None (feature disabled) when the block is absent or has no
+    tiers defined.  Logs a warning (F-1) when the block is present but
+    empty so the operator knows the feature is not active.
+    """
+    pt_block = data.get("permission_tiers")
+    if not pt_block:
+        return None
+    if not pt_block.get("tiers"):
+        logger.warning(
+            "permission_tiers configured but no tiers defined "
+            "— feature disabled.  Add a 'tiers:' block to enable."
+        )
+        return None
+    return PermissionTiersConfig.from_dict(pt_block)
+
+
+@dataclass
 class GatewayConfig:
     """
     Main gateway configuration.
-    
+
     Manages all platform connections, session policies, and delivery settings.
     """
+
     # Platform configurations
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
-    
+
     # Session reset policies by type
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
     reset_by_type: Dict[str, SessionResetPolicy] = field(default_factory=dict)
     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
-    
+
     # Reset trigger commands
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
 
     # User-defined quick commands (slash commands that bypass the agent loop)
     quick_commands: Dict[str, Any] = field(default_factory=dict)
-    
+
     # Storage paths
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
-    
+
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
 
@@ -255,6 +748,9 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+
+    # Permission tiers (opt-in — None means feature is disabled)
+    permission_tiers: Optional[PermissionTiersConfig] = None
 
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -290,43 +786,37 @@ class GatewayConfig:
             elif platform == Platform.WECOM and config.extra.get("bot_id"):
                 connected.append(platform)
         return connected
-    
+
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         """Get the home channel for a platform."""
         config = self.platforms.get(platform)
         if config:
             return config.home_channel
         return None
-    
+
     def get_reset_policy(
-        self, 
-        platform: Optional[Platform] = None,
-        session_type: Optional[str] = None
+        self, platform: Optional[Platform] = None, session_type: Optional[str] = None
     ) -> SessionResetPolicy:
         """
         Get the appropriate reset policy for a session.
-        
+
         Priority: platform override > type override > default
         """
         # Platform-specific override takes precedence
         if platform and platform in self.reset_by_platform:
             return self.reset_by_platform[platform]
-        
+
         # Type-specific override (dm, group, thread)
         if session_type and session_type in self.reset_by_type:
             return self.reset_by_type[session_type]
-        
+
         return self.default_reset_policy
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "platforms": {
-                p.value: c.to_dict() for p, c in self.platforms.items()
-            },
+            "platforms": {p.value: c.to_dict() for p, c in self.platforms.items()},
             "default_reset_policy": self.default_reset_policy.to_dict(),
-            "reset_by_type": {
-                k: v.to_dict() for k, v in self.reset_by_type.items()
-            },
+            "reset_by_type": {k: v.to_dict() for k, v in self.reset_by_type.items()},
             "reset_by_platform": {
                 p.value: v.to_dict() for p, v in self.reset_by_platform.items()
             },
@@ -338,8 +828,11 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "permission_tiers": (
+                self.permission_tiers.to_dict() if self.permission_tiers else None
+            ),
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
         platforms = {}
@@ -349,11 +842,11 @@ class GatewayConfig:
                 platforms[platform] = PlatformConfig.from_dict(platform_data)
             except ValueError:
                 pass  # Skip unknown platforms
-        
+
         reset_by_type = {}
         for type_name, policy_data in data.get("reset_by_type", {}).items():
             reset_by_type[type_name] = SessionResetPolicy.from_dict(policy_data)
-        
+
         reset_by_platform = {}
         for platform_name, policy_data in data.get("reset_by_platform", {}).items():
             try:
@@ -361,22 +854,26 @@ class GatewayConfig:
                 reset_by_platform[platform] = SessionResetPolicy.from_dict(policy_data)
             except ValueError:
                 pass
-        
+
         default_policy = SessionResetPolicy()
         if "default_reset_policy" in data:
             default_policy = SessionResetPolicy.from_dict(data["default_reset_policy"])
-        
+
         sessions_dir = get_hermes_home() / "sessions"
         if "sessions_dir" in data:
             sessions_dir = Path(data["sessions_dir"])
-        
+
         quick_commands = data.get("quick_commands", {})
         if not isinstance(quick_commands, dict):
             quick_commands = {}
 
         stt_enabled = data.get("stt_enabled")
         if stt_enabled is None:
-            stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
+            stt_enabled = (
+                data.get("stt", {}).get("enabled")
+                if isinstance(data.get("stt"), dict)
+                else None
+            )
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
@@ -397,6 +894,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            permission_tiers=_build_permission_tiers(data, logger),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -441,6 +939,7 @@ def load_gateway_config() -> GatewayConfig:
     # Primary source: config.yaml
     try:
         import yaml
+
         config_yaml_path = _home / "config.yaml"
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
@@ -481,10 +980,16 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]
 
             if "unauthorized_dm_behavior" in yaml_cfg:
-                gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
-                    yaml_cfg.get("unauthorized_dm_behavior"),
-                    "pair",
+                gw_data["unauthorized_dm_behavior"] = (
+                    _normalize_unauthorized_dm_behavior(
+                        yaml_cfg.get("unauthorized_dm_behavior"),
+                        "pair",
+                    )
                 )
+
+            pt = yaml_cfg.get("permission_tiers")
+            if isinstance(pt, dict):
+                gw_data["permission_tiers"] = pt
 
             # Merge platforms section from config.yaml into gw_data so that
             # nested keys like platforms.webhook.extra.routes are loaded.
@@ -501,7 +1006,10 @@ def load_gateway_config() -> GatewayConfig:
                     if not isinstance(existing, dict):
                         existing = {}
                     # Deep-merge extra dicts so gateway.json defaults survive
-                    merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
+                    merged_extra = {
+                        **existing.get("extra", {}),
+                        **plat_block.get("extra", {}),
+                    }
                     merged = {**existing, **plat_block}
                     if merged_extra:
                         merged["extra"] = merged_extra
@@ -516,9 +1024,11 @@ def load_gateway_config() -> GatewayConfig:
                 # Collect bridgeable keys from this platform section
                 bridged = {}
                 if "unauthorized_dm_behavior" in platform_cfg:
-                    bridged["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
-                        platform_cfg.get("unauthorized_dm_behavior"),
-                        gw_data.get("unauthorized_dm_behavior", "pair"),
+                    bridged["unauthorized_dm_behavior"] = (
+                        _normalize_unauthorized_dm_behavior(
+                            platform_cfg.get("unauthorized_dm_behavior"),
+                            gw_data.get("unauthorized_dm_behavior", "pair"),
+                        )
                     )
                 if "reply_prefix" in platform_cfg:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
@@ -541,26 +1051,41 @@ def load_gateway_config() -> GatewayConfig:
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
             if isinstance(discord_cfg, dict):
-                if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
-                    os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
+                if "require_mention" in discord_cfg and not os.getenv(
+                    "DISCORD_REQUIRE_MENTION"
+                ):
+                    os.environ["DISCORD_REQUIRE_MENTION"] = str(
+                        discord_cfg["require_mention"]
+                    ).lower()
                 frc = discord_cfg.get("free_response_channels")
                 if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
-                if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
-                    os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-                if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
-                    os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+                if "auto_thread" in discord_cfg and not os.getenv(
+                    "DISCORD_AUTO_THREAD"
+                ):
+                    os.environ["DISCORD_AUTO_THREAD"] = str(
+                        discord_cfg["auto_thread"]
+                    ).lower()
 
             # Telegram settings → env vars (env vars take precedence)
             telegram_cfg = yaml_cfg.get("telegram", {})
             if isinstance(telegram_cfg, dict):
-                if "require_mention" in telegram_cfg and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
-                    os.environ["TELEGRAM_REQUIRE_MENTION"] = str(telegram_cfg["require_mention"]).lower()
-                if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
+                if "require_mention" in telegram_cfg and not os.getenv(
+                    "TELEGRAM_REQUIRE_MENTION"
+                ):
+                    os.environ["TELEGRAM_REQUIRE_MENTION"] = str(
+                        telegram_cfg["require_mention"]
+                    ).lower()
+                if "mention_patterns" in telegram_cfg and not os.getenv(
+                    "TELEGRAM_MENTION_PATTERNS"
+                ):
                     import json as _json
-                    os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
+
+                    os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(
+                        telegram_cfg["mention_patterns"]
+                    )
                 frc = telegram_cfg.get("free_response_chats")
                 if frc is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
                     if isinstance(frc, list):
@@ -578,7 +1103,7 @@ def load_gateway_config() -> GatewayConfig:
 
     # Override with environment variables
     _apply_env_overrides(config)
-    
+
     # --- Validate loaded values ---
     policy = config.default_reset_policy
 
@@ -612,7 +1137,8 @@ def load_gateway_config() -> GatewayConfig:
             logger.warning(
                 "%s is enabled but %s is empty. "
                 "The adapter will likely fail to connect.",
-                platform.value, env_name,
+                platform.value,
+                env_name,
             )
 
     return config
@@ -620,7 +1146,7 @@ def load_gateway_config() -> GatewayConfig:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
-    
+
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
@@ -628,14 +1154,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].enabled = True
         config.platforms[Platform.TELEGRAM].token = telegram_token
-    
+
     # Reply threading mode for Telegram (off/first/all)
     telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
     if telegram_reply_mode in ("off", "first", "all"):
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
-    
+
     telegram_fallback_ips = os.getenv("TELEGRAM_FALLBACK_IPS", "")
     if telegram_fallback_ips:
         if Platform.TELEGRAM not in config.platforms:
@@ -651,7 +1177,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=telegram_home,
             name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
         )
-    
+
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")
     if discord_token:
@@ -659,7 +1185,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.DISCORD] = PlatformConfig()
         config.platforms[Platform.DISCORD].enabled = True
         config.platforms[Platform.DISCORD].token = discord_token
-    
+
     discord_home = os.getenv("DISCORD_HOME_CHANNEL")
     if discord_home and Platform.DISCORD in config.platforms:
         config.platforms[Platform.DISCORD].home_channel = HomeChannel(
@@ -667,14 +1193,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=discord_home,
             name=os.getenv("DISCORD_HOME_CHANNEL_NAME", "Home"),
         )
-    
+
     # WhatsApp (typically uses different auth mechanism)
     whatsapp_enabled = os.getenv("WHATSAPP_ENABLED", "").lower() in ("true", "1", "yes")
     if whatsapp_enabled:
         if Platform.WHATSAPP not in config.platforms:
             config.platforms[Platform.WHATSAPP] = PlatformConfig()
         config.platforms[Platform.WHATSAPP].enabled = True
-    
+
     # Slack
     slack_token = os.getenv("SLACK_BOT_TOKEN")
     if slack_token:
@@ -689,7 +1215,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=slack_home,
             name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
         )
-    
+
     # Signal
     signal_url = os.getenv("SIGNAL_HTTP_URL")
     signal_account = os.getenv("SIGNAL_ACCOUNT")
@@ -697,11 +1223,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.SIGNAL not in config.platforms:
             config.platforms[Platform.SIGNAL] = PlatformConfig()
         config.platforms[Platform.SIGNAL].enabled = True
-        config.platforms[Platform.SIGNAL].extra.update({
-            "http_url": signal_url,
-            "account": signal_account,
-            "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower() in ("true", "1", "yes"),
-        })
+        config.platforms[Platform.SIGNAL].extra.update(
+            {
+                "http_url": signal_url,
+                "account": signal_account,
+                "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower()
+                in ("true", "1", "yes"),
+            }
+        )
     signal_home = os.getenv("SIGNAL_HOME_CHANNEL")
     if signal_home and Platform.SIGNAL in config.platforms:
         config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
@@ -734,7 +1263,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     matrix_homeserver = os.getenv("MATRIX_HOMESERVER", "")
     if matrix_token or os.getenv("MATRIX_PASSWORD"):
         if not matrix_homeserver:
-            logger.warning("MATRIX_ACCESS_TOKEN/MATRIX_PASSWORD set but MATRIX_HOMESERVER is missing")
+            logger.warning(
+                "MATRIX_ACCESS_TOKEN/MATRIX_PASSWORD set but MATRIX_HOMESERVER is missing"
+            )
         if Platform.MATRIX not in config.platforms:
             config.platforms[Platform.MATRIX] = PlatformConfig()
         config.platforms[Platform.MATRIX].enabled = True
@@ -777,11 +1308,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.EMAIL not in config.platforms:
             config.platforms[Platform.EMAIL] = PlatformConfig()
         config.platforms[Platform.EMAIL].enabled = True
-        config.platforms[Platform.EMAIL].extra.update({
-            "address": email_addr,
-            "imap_host": email_imap,
-            "smtp_host": email_smtp,
-        })
+        config.platforms[Platform.EMAIL].extra.update(
+            {
+                "address": email_addr,
+                "imap_host": email_imap,
+                "smtp_host": email_smtp,
+            }
+        )
     email_home = os.getenv("EMAIL_HOME_ADDRESS")
     if email_home and Platform.EMAIL in config.platforms:
         config.platforms[Platform.EMAIL].home_channel = HomeChannel(
@@ -806,7 +1339,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
 
     # API Server
-    api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
+    api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
     api_server_key = os.getenv("API_SERVER_KEY", "")
     api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = os.getenv("API_SERVER_PORT")
@@ -818,12 +1355,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if api_server_key:
             config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
         if api_server_cors_origins:
-            origins = [origin.strip() for origin in api_server_cors_origins.split(",") if origin.strip()]
+            origins = [
+                origin.strip()
+                for origin in api_server_cors_origins.split(",")
+                if origin.strip()
+            ]
             if origins:
                 config.platforms[Platform.API_SERVER].extra["cors_origins"] = origins
         if api_server_port:
             try:
-                config.platforms[Platform.API_SERVER].extra["port"] = int(api_server_port)
+                config.platforms[Platform.API_SERVER].extra["port"] = int(
+                    api_server_port
+                )
             except ValueError:
                 pass
         if api_server_host:
@@ -852,18 +1395,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.FEISHU not in config.platforms:
             config.platforms[Platform.FEISHU] = PlatformConfig()
         config.platforms[Platform.FEISHU].enabled = True
-        config.platforms[Platform.FEISHU].extra.update({
-            "app_id": feishu_app_id,
-            "app_secret": feishu_app_secret,
-            "domain": os.getenv("FEISHU_DOMAIN", "feishu"),
-            "connection_mode": os.getenv("FEISHU_CONNECTION_MODE", "websocket"),
-        })
+        config.platforms[Platform.FEISHU].extra.update(
+            {
+                "app_id": feishu_app_id,
+                "app_secret": feishu_app_secret,
+                "domain": os.getenv("FEISHU_DOMAIN", "feishu"),
+                "connection_mode": os.getenv("FEISHU_CONNECTION_MODE", "websocket"),
+            }
+        )
         feishu_encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "")
         if feishu_encrypt_key:
             config.platforms[Platform.FEISHU].extra["encrypt_key"] = feishu_encrypt_key
         feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
         if feishu_verification_token:
-            config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
+            config.platforms[Platform.FEISHU].extra["verification_token"] = (
+                feishu_verification_token
+            )
         feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
         if feishu_home:
             config.platforms[Platform.FEISHU].home_channel = HomeChannel(
@@ -879,10 +1426,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.WECOM not in config.platforms:
             config.platforms[Platform.WECOM] = PlatformConfig()
         config.platforms[Platform.WECOM].enabled = True
-        config.platforms[Platform.WECOM].extra.update({
-            "bot_id": wecom_bot_id,
-            "secret": wecom_secret,
-        })
+        config.platforms[Platform.WECOM].extra.update(
+            {
+                "bot_id": wecom_bot_id,
+                "secret": wecom_secret,
+            }
+        )
         wecom_ws_url = os.getenv("WECOM_WEBSOCKET_URL", "")
         if wecom_ws_url:
             config.platforms[Platform.WECOM].extra["websocket_url"] = wecom_ws_url
@@ -901,12 +1450,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.default_reset_policy.idle_minutes = int(idle_minutes)
         except ValueError:
             pass
-    
+
     reset_hour = os.getenv("SESSION_RESET_HOUR")
     if reset_hour:
         try:
             config.default_reset_policy.at_hour = int(reset_hour)
         except ValueError:
             pass
-
-
