@@ -4136,12 +4136,14 @@ class GatewayRunner:
         platform = getattr(source, "platform", None)
         platform_str = platform.value if platform else None
         granted_by = getattr(source, "user_id", "system")
+        caller_tier = self._permissions.resolve_user_tier(source)
 
         success, message = self._permissions.set_user_tier(
             target_user_id,
             target_tier,
             granted_by=granted_by,
             source_platform=platform_str,
+            caller_tier=caller_tier,
         )
         if success:
             return f"✅ {message}"
@@ -4228,14 +4230,16 @@ class GatewayRunner:
 
             # Approve: set user tier + mark approved
             admin_id = getattr(source, "user_id", "system")
+            caller_tier = self._permissions.resolve_user_tier(source)
             success, msg = self._permissions.set_user_tier(
                 req["user_id"],
                 req["requested_tier"],
                 granted_by=admin_id,
                 source_platform=(source.platform.value if source.platform else None),
+                caller_tier=caller_tier,
             )
             if success:
-                self._promote_store.approve_request(request_id, approved_by=admin_id)
+                self._promote_store.approve_request(request_id, resolved_by=admin_id)
                 self._audit_log.log(
                     event_type="promote_approved",
                     platform=source.platform.value if source.platform else None,
@@ -4258,7 +4262,7 @@ class GatewayRunner:
                 return f"Request `{request_id}` is already {req['status']}."
 
             admin_id = getattr(source, "user_id", "system")
-            self._promote_store.deny_request(request_id, denied_by=admin_id)
+            self._promote_store.deny_request(request_id, resolved_by=admin_id)
             self._audit_log.log(
                 event_type="promote_denied",
                 platform=source.platform.value if source.platform else None,
@@ -4280,6 +4284,13 @@ class GatewayRunner:
         if requested_tier not in self._permissions.config.tiers:
             available = ", ".join(sorted(self._permissions.config.tiers.keys()))
             return f"Unknown tier `{requested_tier}`. Available: {available}"
+
+        # Owner tier can only be requested by owners (defense-in-depth;
+        # approve-side also enforces this, but reject early with a clear message).
+        if requested_tier == self._permissions.owner_tier_name:
+            current_tier = self._permissions.resolve_user_tier(source)
+            if current_tier != self._permissions.owner_tier_name:
+                return "Only owners can grant the owner tier."
 
         # Check if user already has this tier or higher
         current_tier = self._permissions.resolve_user_tier(source)

@@ -5924,3 +5924,187 @@ class TestCommandAllowlistGating:
         # Should be blocked
         assert result is not None
         assert "higher access" in result.lower()
+
+
+# ------------------------------------------------------------------
+# F-16: Owner escalation guard
+# ------------------------------------------------------------------
+
+
+class TestOwnerEscalationGuard:
+    """Tests for the owner-tier escalation guard.
+
+    Only owners can grant the owner tier via /users set or /promote approve.
+    Non-owners (including admins) are rejected.
+    """
+
+    @staticmethod
+    def _owner_config(**user_overrides):
+        """Build a config with owner, admin, and restricted tiers."""
+        users = {"owner1": UserTierConfig(tier="owner")}
+        users.update(user_overrides)
+        return _make_permission_config(
+            tiers={
+                "owner": TierDefinition(
+                    allowed_toolsets=["*"], allow_exec=True, allow_admin_commands=True
+                ),
+                "admin": _admin_tier(),
+                "restricted": _restricted_tier(),
+            },
+            users=users,
+        )
+
+    def test_set_user_tier_rejects_owner_for_admin_caller(self):
+        """Admin cannot grant owner tier via set_user_tier()."""
+        from gateway.permissions import PermissionManager
+
+        pm = PermissionManager(config=self._owner_config())
+        pm._runtime_store = MagicMock()
+        success, msg = pm.set_user_tier("target_user", "owner", caller_tier="admin")
+        assert not success
+        assert "owner" in msg.lower()
+
+    def test_set_user_tier_allows_owner_for_owner_caller(self):
+        """Owner can grant owner tier via set_user_tier()."""
+        from gateway.permissions import PermissionManager
+
+        pm = PermissionManager(config=self._owner_config())
+        pm._runtime_store = MagicMock()
+        success, msg = pm.set_user_tier("target_user", "owner", caller_tier="owner")
+        assert success
+        assert "owner" in msg.lower()
+
+    def test_set_user_tier_allows_admin_for_admin_caller(self):
+        """Admin can grant non-owner tiers (e.g. admin) without restriction."""
+        from gateway.permissions import PermissionManager
+
+        pm = PermissionManager(config=self._owner_config())
+        pm._runtime_store = MagicMock()
+        success, msg = pm.set_user_tier("target_user", "admin", caller_tier="admin")
+        assert success
+
+    def test_set_user_tier_no_caller_tier_rejects_owner(self):
+        """Without caller_tier (system-initiated), owner tier is rejected."""
+        from gateway.permissions import PermissionManager
+
+        pm = PermissionManager(config=self._owner_config())
+        pm._runtime_store = MagicMock()
+        success, msg = pm.set_user_tier("target_user", "owner")
+        assert not success
+        assert "owner" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_users_set_owner_blocked_for_admin(self, tmp_path):
+        """Admin cannot set another user to owner via /users set."""
+        from gateway.audit import NullAuditLog
+
+        runner = _make_runner(
+            permission_tiers=self._owner_config(
+                admin1=UserTierConfig(tier="admin"),
+            )
+        )
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/users set target_user owner", user_id="admin1")
+        result = await runner._handle_users_command(event)
+
+        assert result is not None
+        assert "❌" in result
+        assert "owner" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_users_set_owner_allowed_for_owner(self, tmp_path):
+        """Owner can set another user to owner via /users set."""
+        from gateway.audit import NullAuditLog
+
+        runner = _make_runner(permission_tiers=self._owner_config())
+        runner._audit_log = NullAuditLog()
+
+        event = _make_event("/users set target_user owner", user_id="owner1")
+        result = await runner._handle_users_command(event)
+
+        assert result is not None
+        assert "✅" in result
+
+    @pytest.mark.asyncio
+    async def test_promote_request_owner_rejected_for_non_owner(self, tmp_path):
+        """Non-owner cannot create a promotion request for the owner tier."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        runner = _make_runner(
+            permission_tiers=self._owner_config(
+                admin1=UserTierConfig(tier="admin"),
+            )
+        )
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        event = _make_event("/promote owner", user_id="admin1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "only owners" in result.lower() or "owner" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_promote_approve_owner_blocked_for_admin(self, tmp_path):
+        """Admin cannot approve a promotion request for the owner tier."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        runner = _make_runner(
+            permission_tiers=self._owner_config(
+                admin1=UserTierConfig(tier="admin"),
+            )
+        )
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        # Create a request directly in the store (simulating a user's request)
+        req = runner._promote_store.create_request(
+            user_id="some_user",
+            platform="telegram",
+            requested_tier="owner",
+            current_tier="user",
+        )
+        assert req is not None
+        request_id = req["id"]
+
+        event = _make_event(f"/promote approve {request_id}", user_id="admin1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "❌" in result
+        assert "owner" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_promote_approve_owner_allowed_for_owner(self, tmp_path):
+        """Owner can approve a promotion request for the owner tier."""
+        from gateway.audit import NullAuditLog
+        from gateway.permissions import PromoteRequestStore
+
+        runner = _make_runner(permission_tiers=self._owner_config())
+        runner._audit_log = NullAuditLog()
+        runner._promote_store = PromoteRequestStore(
+            db_path=str(tmp_path / "promote.db")
+        )
+
+        # Create a request directly in the store
+        req = runner._promote_store.create_request(
+            user_id="some_user",
+            platform="telegram",
+            requested_tier="owner",
+            current_tier="admin",
+        )
+        assert req is not None
+        request_id = req["id"]
+
+        event = _make_event(f"/promote approve {request_id}", user_id="owner1")
+        result = await runner._handle_promote_command(event)
+
+        assert result is not None
+        assert "✅" in result

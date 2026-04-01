@@ -656,17 +656,26 @@ class PermissionManager:
         tr = tier.time_restrictions
         if template and tr:
             try:
+                _day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                _days_str = (
+                    ", ".join(_day_names[d] for d in tr.days if 0 <= d <= 6)
+                    if tr.days is not None
+                    else "every day"
+                )
                 return (
                     template.replace("{start}", str(tr.start))
                     .replace("{end}", str(tr.end))
                     .replace("{timezone}", str(tr.timezone))
+                    .replace("{days}", _days_str)
                 )
             except Exception:
                 return template
         if template:
             return template
 
-        fallbacks = {
+        # --- Dynamic fallback messages ---
+        # Static fallbacks for keys that don't need runtime data.
+        _static_fallbacks = {
             "exec_denied": (
                 "You don't have permission to approve terminal commands. "
                 "Ask an admin to approve it, or use /whoami to check your access level."
@@ -675,16 +684,49 @@ class PermissionManager:
                 "This command requires higher access. Use /whoami to see your "
                 "available commands, or ask an admin to run it for you."
             ),
-            "time_restricted_before": f"Access starts at {tr.start if tr else '08:00'}.",
-            "time_restricted_after": f"Access ended at {tr.end if tr else '22:00'}.",
-            "time_restricted_wrong_day": "Not available today.",
-            "rate_limited": (
-                "You've reached your message limit for this hour. "
-                "Your limit will reset soon — please try again later."
-            ),
-            "rate_limited_blocked": "Access is currently restricted.",
+            "owner_tier_denied": "Only owners can grant the owner tier.",
         }
-        return fallbacks.get(
+
+        # Time-restriction messages: include timezone and available days.
+        if key == "time_restricted_before":
+            _start = tr.start if tr else "08:00"
+            _tz = tr.timezone if tr else "UTC"
+            return f"Access starts at {_start} ({_tz}). Try again then."
+        if key == "time_restricted_after":
+            _end = tr.end if tr else "22:00"
+            _tz = tr.timezone if tr else "UTC"
+            return (
+                f"Access ended at {_end} ({_tz}). Come back during your allowed hours."
+            )
+        if key == "time_restricted_wrong_day":
+            if tr and tr.days is not None:
+                _day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                _available = ", ".join(_day_names[d] for d in tr.days if 0 <= d <= 6)
+                return f"Not available today. Available on: {_available}."
+            return "Not available today."
+
+        # Rate-limit messages: include reset countdown when available.
+        if key == "rate_limited":
+            _reset_in = self.rate_limit_resets_in()
+            if _reset_in is not None:
+                _minutes = max(1, _reset_in // 60)
+                return (
+                    f"You've reached your hourly message limit. "
+                    f"Your limit resets in ~{_minutes} minutes — please try again then. "
+                    f"Use /whoami to check your rate limit status."
+                )
+            return (
+                "You've reached your hourly message limit. "
+                "Your limit will reset at the top of the hour — please try again then. "
+                "Use /whoami to check your rate limit status."
+            )
+        if key == "rate_limited_blocked":
+            return (
+                "Your access is currently restricted. "
+                "Contact an admin or use /whoami to check your permissions."
+            )
+
+        return _static_fallbacks.get(
             key, "Access restricted. Use /whoami to check your permissions."
         )
 
@@ -713,10 +755,12 @@ class PermissionManager:
         tier_name: str,
         granted_by: str = "system",
         source_platform: Optional[str] = None,
+        caller_tier: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Set runtime tier for a user.
 
         Returns (success, message). Validates tier exists before setting.
+        Only owners can grant the owner tier — non-owners are rejected.
         """
         if self._config is None:
             return False, "Permission tiers are not configured."
@@ -725,6 +769,9 @@ class PermissionManager:
             return False, f"Unknown tier '{tier_name}'. Available: {available}"
         if self._runtime_store is None:
             return False, "Runtime user store is not available."
+        # Owner escalation guard: only owners can grant the owner tier.
+        if tier_name == self.owner_tier_name and caller_tier != self.owner_tier_name:
+            return False, f"Only owners can grant the '{self.owner_tier_name}' tier."
         self._runtime_store.set_user_tier(
             user_id, tier_name, granted_by=granted_by, source_platform=source_platform
         )
